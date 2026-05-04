@@ -37,7 +37,7 @@ check_root() {
 # ──────────────────────────────────────────────
 # Variables de configuración (no sensibles)
 # ──────────────────────────────────────────────
-PYTHON_VERSION="3.11"
+PYTHON_VERSION="3.12"
 AIRFLOW_VERSION="2.9.3"
 AIRFLOW_HOME="${AIRFLOW_HOME:-/opt/airflow}"
 MLFLOW_HOME="/opt/mlflow"
@@ -104,7 +104,7 @@ install_base_packages() {
     log_section "Instalando paquetes base"
     apt-get update -y
     apt-get install -y \
-        python3.11 python3.11-venv python3.11-dev python3-pip \
+        python3.12 python3.12-venv python3.12-dev python3-pip \
         build-essential libssl-dev libffi-dev libpq-dev \
         git curl wget unzip jq htop net-tools ufw systemd
 }
@@ -120,7 +120,7 @@ create_mlops_user() {
 
 setup_python_virtualenv() {
     log_section "Configurando entorno virtual Python"
-    python3.11 -m venv "$VENV_PATH"
+    python3.12 -m venv "$VENV_PATH"
     # shellcheck source=/dev/null
     source "$VENV_PATH/bin/activate"
     pip install --upgrade pip setuptools wheel
