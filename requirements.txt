@@ -1,0 +1,37 @@
+# =============================================================================
+# Dependencias del pipeline MLOps de predicción de churn.
+# Instalar con: pip install -r requirements.txt
+# =============================================================================
+
+# ── Orquestación ──────────────────────────────────────────────────────────────
+apache-airflow==2.9.3
+
+# ── Tracking y registry de modelos ───────────────────────────────────────────
+mlflow[extras]==2.15.1
+
+# ── Versionado de datos ───────────────────────────────────────────────────────
+dvc[s3]==3.51.2
+
+# ── Machine Learning ──────────────────────────────────────────────────────────
+scikit-learn==1.5.1
+pandas==2.2.2
+numpy==1.26.4
+joblib==1.4.2
+
+# ── Visualización ─────────────────────────────────────────────────────────────
+matplotlib==3.9.2
+
+# ── API de inferencia ─────────────────────────────────────────────────────────
+fastapi==0.112.0
+uvicorn[standard]==0.30.5
+pydantic==2.8.2
+python-multipart==0.0.9
+
+# ── Almacenamiento S3 / MinIO ─────────────────────────────────────────────────
+boto3==1.35.0
+# pyarrow: mlflow 2.15.1 requiere <16 — no subir a 17.x
+pyarrow==15.0.2
+s3fs==2024.9.0
+
+# ── Gestión de secretos ───────────────────────────────────────────────────────
+hvac==2.3.0
