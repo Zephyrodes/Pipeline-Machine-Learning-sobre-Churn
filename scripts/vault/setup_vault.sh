@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Instala HashiCorp Vault como servicio systemd, lo inicializa, habilita
-# el motor KV v2 y configura el método de autenticación AppRole para que
-# cada servicio del pipeline pueda obtener sus credenciales de forma segura.
+# Instala HashiCorp Vault, lo inicializa, habilita el motor KV v2 y configura
+# AppRole por servicio.
 #
-# Ejecución única — después del aprovisionamiento base (provision_vm.sh).
+# Compatible con VMs (systemd) y contenedores (proceso directo).
+# El script detecta automáticamente el entorno y actúa en consecuencia.
+#
+# Prerequisito: provision_vm.sh debe haberse ejecutado primero.
 #
 # Uso:
 #   sudo ./scripts/vault/setup_vault.sh
@@ -30,18 +32,43 @@ check_root() {
 }
 
 # ──────────────────────────────────────────────
+# Detectar si systemd está disponible
+# ──────────────────────────────────────────────
+SYSTEMD_AVAILABLE=false
+if systemctl is-system-running &>/dev/null 2>&1; then
+    SYSTEMD_AVAILABLE=true
+fi
+
+start_service() {
+    local service_name="$1"
+    local exec_cmd="$2"
+    local pidfile="/run/${service_name}.pid"
+
+    if $SYSTEMD_AVAILABLE; then
+        systemctl daemon-reload
+        systemctl enable "$service_name"
+        systemctl start  "$service_name"
+    else
+        log_warn "systemd no disponible — arrancando $service_name como proceso directo"
+        # Arrancar en segundo plano y guardar PID
+        nohup $exec_cmd >> "/var/log/${service_name}.log" 2>&1 &
+        echo $! > "$pidfile"
+        log_info "$service_name PID: $(cat $pidfile)"
+    fi
+}
+
+# ──────────────────────────────────────────────
 # Variables
 # ──────────────────────────────────────────────
 VAULT_VERSION="1.17.2"
 VAULT_ADDR="http://127.0.0.1:8200"
 VAULT_DATA_DIR="/opt/vault/data"
 VAULT_CONFIG_DIR="/etc/vault.d"
-VAULT_KEYS_DIR="/etc/mlops/vault-init"   # unseal keys + root token (chmod 600, fuera del repo)
-VAULT_KV_PATH="mlops"                    # path del motor KV: secret/mlops/...
+VAULT_KEYS_DIR="/etc/mlops/vault-init"
+VAULT_KV_PATH="mlops"
 MLOPS_POLICY_NAME="mlops-services"
 VAULT_USER="vault"
 
-# Servicios del pipeline y sus roles en Vault
 declare -A SERVICE_ROLES=(
     ["airflow"]="mlops-airflow"
     ["mlflow"]="mlops-mlflow"
@@ -62,7 +89,7 @@ install_vault() {
         return
     fi
 
-    apt-get install -y gpg
+    apt-get install -y gpg lsb-release
     wget -qO - https://apt.releases.hashicorp.com/gpg | \
         gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
 
@@ -76,12 +103,12 @@ https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
 }
 
 # ──────────────────────────────────────────────
-# 2. Configuración y servicio systemd
+# 2. Configuración y arranque
 # ──────────────────────────────────────────────
-configure_vault_service() {
-    log_section "Configurando Vault como servicio systemd"
+configure_and_start_vault() {
+    log_section "Configurando y arrancando Vault"
 
-    # Usuario del sistema para Vault
+    # Usuario del sistema
     if ! id "$VAULT_USER" &>/dev/null; then
         useradd --system --home "$VAULT_DATA_DIR" \
                 --shell /bin/false "$VAULT_USER"
@@ -90,7 +117,6 @@ configure_vault_service() {
     mkdir -p "$VAULT_DATA_DIR" "$VAULT_CONFIG_DIR"
     chown -R "$VAULT_USER:$VAULT_USER" "$VAULT_DATA_DIR"
 
-    # Configuración de Vault: almacenamiento local en disco (Raft integrado)
     cat > "$VAULT_CONFIG_DIR/vault.hcl" << 'HCL'
 ui            = false
 disable_mlock = true
@@ -102,7 +128,7 @@ storage "raft" {
 
 listener "tcp" {
     address     = "127.0.0.1:8200"
-    tls_disable = true          # solo loopback — en producción usar TLS
+    tls_disable = true
 }
 
 api_addr     = "http://127.0.0.1:8200"
@@ -111,10 +137,10 @@ HCL
     chmod 640 "$VAULT_CONFIG_DIR/vault.hcl"
     chown root:"$VAULT_USER" "$VAULT_CONFIG_DIR/vault.hcl"
 
-    cat > /etc/systemd/system/vault.service << EOF
+    if $SYSTEMD_AVAILABLE; then
+        cat > /etc/systemd/system/vault.service << EOF
 [Unit]
 Description=HashiCorp Vault
-Documentation=https://www.vaultproject.io/docs/
 After=network-online.target
 Wants=network-online.target
 
@@ -136,12 +162,24 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+        start_service "vault" ""
+    else
+        # Contenedor: arrancar Vault directamente como proceso
+        mkdir -p /var/log
+        nohup su -s /bin/bash "$VAULT_USER" -c \
+            "vault server -config=$VAULT_CONFIG_DIR/vault.hcl" \
+            >> /var/log/vault.log 2>&1 &
+        echo $! > /run/vault.pid
+        log_info "Vault arrancado como proceso (PID: $(cat /run/vault.pid))"
+    fi
 
-    systemctl daemon-reload
-    systemctl enable vault
-    systemctl start vault
-    sleep 3
-    log_info "Servicio Vault iniciado"
+    # Esperar a que Vault esté listo
+    local retries=10
+    until vault status &>/dev/null || [[ $retries -eq 0 ]]; do
+        sleep 2
+        (( retries-- )) || true
+    done
+    log_info "Vault accesible en $VAULT_ADDR"
 }
 
 # ──────────────────────────────────────────────
@@ -150,6 +188,13 @@ EOF
 initialize_vault() {
     log_section "Inicializando Vault"
 
+    # Si ya está inicializado, solo hacer unseal
+    if vault status 2>/dev/null | grep -q "Initialized.*true"; then
+        log_warn "Vault ya inicializado — procediendo al unseal"
+        unseal_vault
+        return
+    fi
+
     mkdir -p "$VAULT_KEYS_DIR"
     chmod 700 "$VAULT_KEYS_DIR"
 
@@ -157,150 +202,113 @@ initialize_vault() {
     init_output=$(vault operator init \
         -key-shares=3 \
         -key-threshold=2 \
-        -format=json 2>/dev/null)
+        -format=json)
 
-    # Guardar unseal keys y root token — chmod 600, solo root puede leer
     echo "$init_output" > "$VAULT_KEYS_DIR/init.json"
     chmod 600 "$VAULT_KEYS_DIR/init.json"
-
     log_warn "Unseal keys y root token guardados en $VAULT_KEYS_DIR/init.json"
-    log_warn "Haz un backup seguro de este archivo y elimínalo del servidor en producción."
+    log_warn "Haz backup de este archivo y elimínalo del servidor en producción."
 
-    # Extraer keys y token
-    local unseal_key_1 unseal_key_2 root_token
-    unseal_key_1=$(echo "$init_output" | python3 -c "import sys,json; print(json.load(sys.stdin)['unseal_keys_b64'][0])")
-    unseal_key_2=$(echo "$init_output" | python3 -c "import sys,json; print(json.load(sys.stdin)['unseal_keys_b64'][1])")
-    root_token=$(echo  "$init_output" | python3 -c "import sys,json; print(json.load(sys.stdin)['root_token'])")
+    local key1 key2 root_token
+    key1=$(echo "$init_output" | python3 -c "import sys,json; print(json.load(sys.stdin)['unseal_keys_b64'][0])")
+    key2=$(echo "$init_output" | python3 -c "import sys,json; print(json.load(sys.stdin)['unseal_keys_b64'][1])")
+    root_token=$(echo "$init_output" | python3 -c "import sys,json; print(json.load(sys.stdin)['root_token'])")
 
-    # Unseal con 2 de 3 keys (threshold=2)
-    vault operator unseal "$unseal_key_1"
-    vault operator unseal "$unseal_key_2"
+    vault operator unseal "$key1"
+    vault operator unseal "$key2"
 
     export VAULT_TOKEN="$root_token"
     log_info "Vault inicializado y unsealed"
 }
 
 unseal_vault() {
-    # Para reinicios posteriores — se llama desde un servicio o manualmente
     local init_file="$VAULT_KEYS_DIR/init.json"
-    if [[ ! -f "$init_file" ]]; then
-        log_error "No se encontró $init_file — ejecuta setup_vault.sh completo primero"
-        exit 1
-    fi
-    local unseal_key_1 unseal_key_2
-    unseal_key_1=$(python3 -c "import json; d=json.load(open('$init_file')); print(d['unseal_keys_b64'][0])")
-    unseal_key_2=$(python3 -c "import json; d=json.load(open('$init_file')); print(d['unseal_keys_b64'][1])")
-    vault operator unseal "$unseal_key_1"
-    vault operator unseal "$unseal_key_2"
+    [[ -f "$init_file" ]] || { log_error "No se encontró $init_file"; exit 1; }
+
+    local key1 key2
+    key1=$(python3 -c "import json; print(json.load(open('$init_file'))['unseal_keys_b64'][0])")
+    key2=$(python3 -c "import json; print(json.load(open('$init_file'))['unseal_keys_b64'][1])")
+    vault operator unseal "$key1"
+    vault operator unseal "$key2"
     log_info "Vault unsealed"
 }
 
 # ──────────────────────────────────────────────
-# 4. Motor KV v2 y secretos del pipeline
+# 4. Motor KV v2
 # ──────────────────────────────────────────────
 configure_kv_store() {
     log_section "Configurando motor KV v2"
-
     vault secrets enable -path="$VAULT_KV_PATH" kv-v2 2>/dev/null \
         || log_warn "Motor KV ya habilitado en $VAULT_KV_PATH"
-
-    log_info "Los secretos se escriben con: vault/setup_vault_secrets.sh"
-    log_info "Motor KV disponible en: $VAULT_KV_PATH/"
 }
 
 # ──────────────────────────────────────────────
-# 5. Policy — define qué puede leer cada servicio
+# 5. Policy
 # ──────────────────────────────────────────────
 create_vault_policy() {
     log_section "Creando política $MLOPS_POLICY_NAME"
-
     vault policy write "$MLOPS_POLICY_NAME" - << POLICY
-# Política para los servicios del pipeline MLOps
-# Acceso de solo lectura a los secretos del path mlops/
-
-path "${VAULT_KV_PATH}/data/minio" {
-    capabilities = ["read"]
-}
-
-path "${VAULT_KV_PATH}/data/airflow" {
-    capabilities = ["read"]
-}
-
-path "${VAULT_KV_PATH}/data/mlflow" {
-    capabilities = ["read"]
-}
-
-path "${VAULT_KV_PATH}/data/fastapi" {
-    capabilities = ["read"]
-}
+path "${VAULT_KV_PATH}/data/minio"   { capabilities = ["read"] }
+path "${VAULT_KV_PATH}/data/airflow" { capabilities = ["read"] }
+path "${VAULT_KV_PATH}/data/mlflow"  { capabilities = ["read"] }
+path "${VAULT_KV_PATH}/data/fastapi" { capabilities = ["read"] }
 POLICY
-
     log_info "Política $MLOPS_POLICY_NAME creada"
 }
 
 # ──────────────────────────────────────────────
-# 6. AppRole — un role por servicio
+# 6. AppRole por servicio
 # ──────────────────────────────────────────────
 configure_approle() {
-    log_section "Configurando método de autenticación AppRole"
-
-    vault auth enable approle 2>/dev/null \
-        || log_warn "AppRole ya habilitado"
+    log_section "Configurando AppRole"
+    vault auth enable approle 2>/dev/null || log_warn "AppRole ya habilitado"
 
     for service in "${!SERVICE_ROLES[@]}"; do
         local role_name="${SERVICE_ROLES[$service]}"
         local role_dir="$VAULT_KEYS_DIR/$service"
         mkdir -p "$role_dir"
 
-        # Crear el role — token válido 1h, renovable, limitado a la policy del pipeline
         vault write "auth/approle/role/$role_name" \
             token_policies="$MLOPS_POLICY_NAME" \
             token_ttl=1h \
             token_max_ttl=4h \
-            secret_id_ttl=0          # secret_id no expira (rotar manualmente)
+            secret_id_ttl=0
 
-        # Obtener role_id (no secreto — puede estar en el repo o en la VM)
-        local role_id
+        local role_id secret_id
         role_id=$(vault read -field=role_id "auth/approle/role/$role_name/role-id")
-        echo "$role_id" > "$role_dir/role_id"
-        chmod 644 "$role_dir/role_id"   # no es secreto
-
-        # Generar secret_id (secreto — solo root puede leer)
-        local secret_id
         secret_id=$(vault write -field=secret_id -f "auth/approle/role/$role_name/secret-id")
-        echo "$secret_id" > "$role_dir/secret_id"
-        chmod 600 "$role_dir/secret_id"
-        chown root:root "$role_dir/secret_id"
 
-        log_info "AppRole '$role_name' configurado → $role_dir/"
+        echo "$role_id"   > "$role_dir/role_id"
+        echo "$secret_id" > "$role_dir/secret_id"
+        chmod 644 "$role_dir/role_id"
+        chmod 600 "$role_dir/secret_id"
+
+        log_info "AppRole '$role_name' → $role_dir/"
     done
 }
 
 # ──────────────────────────────────────────────
-# 7. Script de unseal automático post-reinicio
+# 7. Servicio de unseal automático (solo systemd)
 # ──────────────────────────────────────────────
 create_unseal_service() {
+    $SYSTEMD_AVAILABLE || { log_warn "systemd no disponible — unseal automático omitido"; return; }
+
     log_section "Creando servicio de unseal automático"
 
     cat > /usr/local/bin/vault-unseal.sh << 'UNSEAL'
 #!/usr/bin/env bash
-# Unseal automático de Vault tras un reinicio del sistema.
-# En producción considerar Vault Auto Unseal con KMS (AWS/Azure/GCP).
 set -euo pipefail
 VAULT_ADDR="http://127.0.0.1:8200"
 INIT_FILE="/etc/mlops/vault-init/init.json"
 export VAULT_ADDR
-
-sleep 5  # Esperar a que el proceso de Vault esté listo
-
+sleep 5
 if vault status 2>/dev/null | grep -q "Sealed.*true"; then
-    KEY1=$(python3 -c "import json; d=json.load(open('$INIT_FILE')); print(d['unseal_keys_b64'][0])")
-    KEY2=$(python3 -c "import json; d=json.load(open('$INIT_FILE')); print(d['unseal_keys_b64'][1])")
+    KEY1=$(python3 -c "import json; print(json.load(open('$INIT_FILE'))['unseal_keys_b64'][0])")
+    KEY2=$(python3 -c "import json; print(json.load(open('$INIT_FILE'))['unseal_keys_b64'][1])")
     vault operator unseal "$KEY1"
     vault operator unseal "$KEY2"
 fi
 UNSEAL
-
     chmod 700 /usr/local/bin/vault-unseal.sh
 
     cat > /etc/systemd/system/vault-unseal.service << EOF
@@ -317,7 +325,6 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-
     systemctl daemon-reload
     systemctl enable vault-unseal
     log_info "Servicio vault-unseal habilitado"
@@ -331,19 +338,16 @@ print_next_steps() {
     echo ""
     echo "  Próximos pasos:"
     echo "  1. Escribir los secretos del pipeline:"
-    echo "     sudo ./scripts/vault/write_secrets.sh"
+    echo "     sudo VAULT_TOKEN=\$(python3 -c \"import json; print(json.load(open('/etc/mlops/vault-init/init.json'))['root_token'])\") \\"
+    echo "       ./scripts/vault/write_secrets.sh"
     echo ""
-    echo "  2. Verificar que los servicios pueden leer sus secretos:"
-    echo "     sudo ./scripts/vault/fetch_secrets.sh airflow"
-    echo ""
-    echo "  IMPORTANTE: Haz backup de $VAULT_KEYS_DIR/init.json"
-    echo "  y elimínalo del servidor en producción."
+    echo "  IMPORTANTE: Haz backup de /etc/mlops/vault-init/init.json"
 }
 
 main() {
     check_root
     install_vault
-    configure_vault_service
+    configure_and_start_vault
     initialize_vault
     configure_kv_store
     create_vault_policy

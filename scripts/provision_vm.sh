@@ -9,7 +9,7 @@
 #   (tmpfs — solo memoria, se limpia en cada reinicio).
 #   LoadCredential= los entrega al proceso sin exponerlos en el entorno.
 #
-# Prerequisito: ejecutar scripts/vault/setup_vault.sh primero.
+# Paso 1 del despliegue — ejecutar antes que setup_vault.sh.
 #
 # Uso:
 #   sudo ./scripts/provision_vm.sh
@@ -37,7 +37,7 @@ check_root() {
 # ──────────────────────────────────────────────
 # Variables de configuración (no sensibles)
 # ──────────────────────────────────────────────
-PYTHON_VERSION="3.12"
+PYTHON_VERSION="3.11"
 AIRFLOW_VERSION="2.9.3"
 AIRFLOW_HOME="${AIRFLOW_HOME:-/opt/airflow}"
 MLFLOW_HOME="/opt/mlflow"
@@ -54,6 +54,29 @@ PORT_MINIO_CONSOLE=9001
 PORT_FASTAPI="${FASTAPI_PORT:-8000}"
 
 SECRETS_BASE="/run/mlops-secrets"   # tmpfs — limpiado en cada reinicio
+
+# ──────────────────────────────────────────────
+# Detectar si systemd está disponible
+# En contenedores systemd no corre — se usa
+# arranque directo de procesos como fallback
+# ──────────────────────────────────────────────
+SYSTEMD_AVAILABLE=false
+if systemctl is-system-running &>/dev/null 2>&1; then
+    SYSTEMD_AVAILABLE=true
+fi
+
+enable_and_start() {
+    local unit="$1"
+    if $SYSTEMD_AVAILABLE; then
+        systemctl daemon-reload
+        systemctl enable "$unit"
+        systemctl start  "$unit"
+    else
+        log_warn "systemd no disponible — $unit debe arrancarse manualmente"
+        log_warn "  Usa: journalctl o revisa /var/log/${unit}.log"
+    fi
+}
+
 
 # ──────────────────────────────────────────────
 # fetch_secrets.sh — script que cada servicio
@@ -81,7 +104,7 @@ install_base_packages() {
     log_section "Instalando paquetes base"
     apt-get update -y
     apt-get install -y \
-        python3.12 python3.12-venv python3.12-dev python3-pip \
+        python3.11 python3.11-venv python3.11-dev python3-pip \
         build-essential libssl-dev libffi-dev libpq-dev \
         git curl wget unzip jq htop net-tools ufw systemd
 }
@@ -97,7 +120,7 @@ create_mlops_user() {
 
 setup_python_virtualenv() {
     log_section "Configurando entorno virtual Python"
-    python3.12 -m venv "$VENV_PATH"
+    python3.11 -m venv "$VENV_PATH"
     # shellcheck source=/dev/null
     source "$VENV_PATH/bin/activate"
     pip install --upgrade pip setuptools wheel
@@ -144,8 +167,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable minio
+    enable_and_start minio
     log_info "MinIO configurado"
 }
 
@@ -186,8 +208,7 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable mlflow-server
+    enable_and_start mlflow-server
     log_info "MLflow configurado"
 }
 
@@ -258,8 +279,8 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable airflow-webserver airflow-scheduler
+    enable_and_start airflow-webserver
+    enable_and_start airflow-scheduler
 }
 
 # ──────────────────────────────────────────────
@@ -294,8 +315,7 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable mlops-api
+    enable_and_start mlops-api
     log_info "FastAPI configurado"
 }
 
@@ -328,28 +348,30 @@ configure_firewall() {
 }
 
 start_all_services() {
-    log_section "Iniciando servicios"
-    # Vault debe estar unsealed antes de que los demás arranquen
-    systemctl start vault vault-unseal
-    sleep 5
-    systemctl start minio
-    sleep 3
-    systemctl start mlflow-server
-    sleep 2
-    systemctl start airflow-webserver airflow-scheduler
-    log_info "Todos los servicios iniciados"
+    log_section "Iniciando servicios base"
+    # Vault NO se arranca aquí — es responsabilidad de setup_vault.sh,
+    # que lo instala, inicializa y hace el unseal por primera vez.
+    # Los servicios del pipeline (minio, mlflow, airflow, fastapi) arrancan
+    # después de setup_vault.sh, cuando Vault ya está listo para servir secretos.
+    log_info "Servicios registrados en systemd."
+    log_info "Siguiente paso: sudo ./scripts/vault/setup_vault.sh"
 }
 
 print_summary() {
     VM_IP=$(hostname -I | awk '{print $1}')
     log_section "Aprovisionamiento completo"
+    echo ""
+    echo -e "  Servicios registrados (arrancan después de Vault):"
     echo -e "  ${GREEN}Airflow:${NC}       http://$VM_IP:$PORT_AIRFLOW_WEBSERVER"
     echo -e "  ${GREEN}MLflow:${NC}        http://$VM_IP:$PORT_MLFLOW_UI"
     echo -e "  ${GREEN}MinIO:${NC}         http://$VM_IP:$PORT_MINIO_CONSOLE"
     echo -e "  ${GREEN}FastAPI:${NC}       http://$VM_IP:$PORT_FASTAPI/docs"
     echo -e "  ${GREEN}Vault:${NC}         http://127.0.0.1:8200 (solo loopback)"
     echo ""
-    log_warn "Ejecuta scripts/vault/setup_vault.sh para configurar Vault y cargar secretos."
+    echo -e "  Orden de pasos siguientes:"
+    echo -e "  1. sudo ./scripts/vault/setup_vault.sh"
+    echo -e "  2. sudo VAULT_TOKEN=<token> ./scripts/vault/write_secrets.sh"
+    echo -e "  3. systemctl start minio mlflow-server airflow-webserver airflow-scheduler mlops-api"
 }
 
 # ──────────────────────────────────────────────
