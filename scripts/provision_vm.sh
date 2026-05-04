@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
+# provision_vm.sh
 # Aprovisiona la VM e instala todos los servicios del pipeline MLOps.
 #
 # Gestión de secretos:
@@ -65,16 +66,14 @@ if systemctl is-system-running &>/dev/null 2>&1; then
     SYSTEMD_AVAILABLE=true
 fi
 
-enable_and_start() {
+register_service() {
+    # Solo registra y habilita el servicio en systemd.
+    # NO lo arranca — el arranque ocurre en el paso 5,
+    # después de que Vault esté inicializado y los secretos escritos.
     local unit="$1"
-    if $SYSTEMD_AVAILABLE; then
-        systemctl daemon-reload
-        systemctl enable "$unit"
-        systemctl start  "$unit"
-    else
-        log_warn "systemd no disponible — $unit debe arrancarse manualmente"
-        log_warn "  Usa: journalctl o revisa /var/log/${unit}.log"
-    fi
+    systemctl daemon-reload
+    systemctl enable "$unit"
+    log_info "Servicio $unit registrado (pendiente de arranque)"
 }
 
 
@@ -167,7 +166,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-    enable_and_start minio
+    register_service minio
     log_info "MinIO configurado"
 }
 
@@ -208,7 +207,7 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    enable_and_start mlflow-server
+    register_service mlflow-server
     log_info "MLflow configurado"
 }
 
@@ -279,8 +278,8 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    enable_and_start airflow-webserver
-    enable_and_start airflow-scheduler
+    register_service airflow-webserver
+    register_service airflow-scheduler
 }
 
 # ──────────────────────────────────────────────
@@ -315,7 +314,7 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-    enable_and_start mlops-api
+    register_service mlops-api
     log_info "FastAPI configurado"
 }
 
