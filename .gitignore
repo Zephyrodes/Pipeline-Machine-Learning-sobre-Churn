@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Entorno virtual
+.venv/
+venv/
+env/
+
+# DVC — datos gestionados por DVC, no por git
+/data/raw/*.csv
+/data/raw/*.parquet
+/data/processed/*.parquet
+/data/processed/*.csv
+/models/*.joblib
+/models/*.pkl
+
+# DVC credenciales locales (generado por dvc remote modify --local)
+.dvc/config.local
+.dvc/tmp/
+
+# MLflow
+mlruns/
+
+# Logs
+logs/
+*.log
+
+# Claves y certificados — por si acaso
+*.pem
+*.key
+*.p12
+secrets/
+
+# El .env tiene los secretos reales — nunca va al repositorio
+# Las credenciales viven en /etc/mlops/credentials (fuera del repo)
+.env
+*.env
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# Plots temporales
+/tmp/mlops_plots/
