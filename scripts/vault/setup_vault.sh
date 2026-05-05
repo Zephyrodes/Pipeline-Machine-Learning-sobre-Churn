@@ -429,25 +429,45 @@ configure_approle() {
 
         mkdir -p "$role_dir"
 
-        # role_id es estable — solo leer si el archivo no existe
-        if [[ ! -f "$role_dir/role_id" ]]; then
-            vault read -field=role_id "auth/approle/role/$role_name/role-id" \
-                > "$role_dir/role_id"
-            log_info "role_id generado para $service"
+        # role_id: estable dentro de una instancia de Vault.
+        # Se regenera si el archivo no existe O si el role_id en disco
+        # no coincide con el que Vault reporta ahora (indica reinicialización).
+        local current_role_id
+        current_role_id=$(vault read -field=role_id "auth/approle/role/$role_name/role-id")
+        if [[ ! -f "$role_dir/role_id" ]] ||            [[ "$(cat "$role_dir/role_id")" != "$current_role_id" ]]; then
+            echo "$current_role_id" > "$role_dir/role_id"
+            log_info "role_id actualizado para $service"
         else
-            log_skip "role_id de $service ya existe"
+            log_skip "role_id de $service sin cambios"
         fi
 
-        # secret_id: generar uno nuevo solo si no existe.
-        # En producción, rotar manualmente con:
-        #   vault write -f auth/approle/role/<role>/secret-id
-        if [[ ! -f "$role_dir/secret_id" ]]; then
+        # secret_id: verificar que el que está en disco sigue siendo válido
+        # intentando un login de prueba. Si falla (Vault reinicializado, secret_id
+        # revocado, o archivo corrupto), generar uno nuevo.
+        #
+        # lookup-secret-id requiere el secret_id en texto plano, no el accessor,
+        # así que hacemos un login real con token_ttl mínimo como prueba de validez.
+        local needs_new_secret_id=true
+        if [[ -f "$role_dir/secret_id" ]]; then
+            local test_token
+            test_token=$(vault write -field=token auth/approle/login \
+                role_id="$current_role_id" \
+                secret_id="$(cat "$role_dir/secret_id")" 2>/dev/null || true)
+            if [[ -n "$test_token" ]]; then
+                # Token válido obtenido → secret_id sigue activo; revocar el token de prueba
+                vault token revoke "$test_token" &>/dev/null || true
+                needs_new_secret_id=false
+                log_skip "secret_id de $service sigue siendo válido"
+            else
+                log_warn "secret_id de $service inválido o expirado — regenerando"
+            fi
+        fi
+
+        if $needs_new_secret_id; then
             vault write -field=secret_id -f \
                 "auth/approle/role/$role_name/secret-id" \
                 > "$role_dir/secret_id"
-            log_info "secret_id generado para $service"
-        else
-            log_skip "secret_id de $service ya existe"
+            log_info "secret_id regenerado para $service"
         fi
 
         # Árbol de permisos:
