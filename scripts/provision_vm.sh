@@ -90,6 +90,31 @@ install_fetch_secrets() {
 }
 
 # ──────────────────────────────────────────────
+# tmpfiles.d — crea /run/mlops-secrets en cada
+# arranque del sistema (el tmpfs /run se vacía en
+# cada reinicio; systemd-tmpfiles lo recrea).
+#
+# El directorio pertenece al usuario mlops para
+# que ExecStartPre= (que corre como mlops) pueda
+# crear los subdirectorios de cada servicio.
+# ──────────────────────────────────────────────
+setup_tmpfiles() {
+    log_section "Configurando tmpfiles.d para /run/mlops-secrets"
+
+    cat > /etc/tmpfiles.d/mlops-secrets.conf << EOF
+# /run/mlops-secrets — directorio en tmpfs para credenciales efímeras de los
+# servicios MLOps. Se recrean en cada arranque; nunca tocan disco persistente.
+# Propietario mlops:mlops para que ExecStartPre= (usuario mlops) pueda
+# crear los subdirectorios sin necesitar root.
+d ${SECRETS_BASE} 0700 ${MLOPS_USER} ${MLOPS_GROUP} -
+EOF
+
+    # Aplicar ahora (sin reiniciar) para que el directorio exista de inmediato
+    systemd-tmpfiles --create /etc/tmpfiles.d/mlops-secrets.conf
+    log_info "tmpfiles.d configurado → ${SECRETS_BASE} (propietario: ${MLOPS_USER})"
+}
+
+# ──────────────────────────────────────────────
 # Paquetes base del sistema
 # ──────────────────────────────────────────────
 detect_os() {
@@ -134,18 +159,25 @@ install_minio() {
     chmod +x /usr/local/bin/minio
     chown -R "$MLOPS_USER:$MLOPS_GROUP" "$MINIO_HOME"
 
+    # FIX: After=vault.service garantiza que systemd arranque este servicio
+    # DESPUÉS de que Vault esté activo. Requires=vault.service hace que systemd
+    # no intente arrancar minio si vault no está corriendo, evitando que
+    # ExecStartPre= (fetch_secrets.sh) falle en silencio por conexión rechazada.
+    # Antes solo existía Wants=vault.service, que no impone orden de arranque.
     cat > /etc/systemd/system/minio.service << EOF
 [Unit]
 Description=MinIO Object Storage
-After=network-online.target
-Wants=vault.service
+After=network-online.target vault.service
+Wants=network-online.target
+Requires=vault.service
 
 [Service]
 # fetch_secrets.sh autentica con Vault via AppRole y escribe las credenciales
-# al proceso sin exponerlas en variables de entorno visibles.
-ExecStartPre=/usr/local/bin/fetch_secrets.sh minio
+# en tmpfs. VAULT_ADDR debe declararse aquí explícitamente porque systemd no
+# hereda el entorno de la shell que ejecutó el script de aprovisionamiento.
 Environment=VAULT_ADDR=http://127.0.0.1:8200
 Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/minio/credentials
+ExecStartPre=/usr/local/bin/fetch_secrets.sh minio
 ExecStart=/bin/bash -c '\
     source \${SERVICE_SECRETS_FILE} && \
     MINIO_ROOT_USER=\${ROOT_USER} \
@@ -180,17 +212,18 @@ install_mlflow() {
     mkdir -p "$MLFLOW_HOME/artifacts" "$MLFLOW_HOME/db"
     chown -R "$MLOPS_USER:$MLOPS_GROUP" "$MLFLOW_HOME"
 
+    # FIX: After=vault.service + Requires=vault.service (idem minio)
     cat > /etc/systemd/system/mlflow-server.service << EOF
 [Unit]
 Description=MLflow Tracking Server
-After=network.target minio.service
-Wants=vault.service
+After=network.target minio.service vault.service
+Requires=vault.service
 
 [Service]
-ExecStartPre=/usr/local/bin/fetch_secrets.sh mlflow
 Environment=VAULT_ADDR=http://127.0.0.1:8200
 Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/mlflow/credentials
 Environment=PATH=${VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStartPre=/usr/local/bin/fetch_secrets.sh mlflow
 ExecStart=/bin/bash -c '\
     source \${SERVICE_SECRETS_FILE} && \
     ${VENV_PATH}/bin/mlflow server \
@@ -231,18 +264,19 @@ install_airflow() {
 }
 
 create_airflow_systemd_services() {
+    # FIX: After=vault.service + Requires=vault.service en ambos units
     cat > /etc/systemd/system/airflow-webserver.service << EOF
 [Unit]
 Description=Apache Airflow Webserver
-After=network.target
-Wants=vault.service
+After=network.target vault.service
+Requires=vault.service
 
 [Service]
-ExecStartPre=/usr/local/bin/fetch_secrets.sh airflow
 Environment=VAULT_ADDR=http://127.0.0.1:8200
 Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/airflow/credentials
 Environment=AIRFLOW_HOME=${AIRFLOW_HOME}
 Environment=PATH=${VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStartPre=/usr/local/bin/fetch_secrets.sh airflow
 ExecStart=/bin/bash -c '\
     source \${SERVICE_SECRETS_FILE} && \
     ${VENV_PATH}/bin/airflow webserver --port ${PORT_AIRFLOW_WEBSERVER}'
@@ -260,15 +294,15 @@ EOF
     cat > /etc/systemd/system/airflow-scheduler.service << EOF
 [Unit]
 Description=Apache Airflow Scheduler
-After=network.target
-Wants=vault.service
+After=network.target vault.service
+Requires=vault.service
 
 [Service]
-ExecStartPre=/usr/local/bin/fetch_secrets.sh airflow
 Environment=VAULT_ADDR=http://127.0.0.1:8200
 Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/airflow/credentials
 Environment=AIRFLOW_HOME=${AIRFLOW_HOME}
 Environment=PATH=${VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStartPre=/usr/local/bin/fetch_secrets.sh airflow
 ExecStart=/bin/bash -c '\
     source \${SERVICE_SECRETS_FILE} && \
     ${VENV_PATH}/bin/airflow scheduler'
@@ -295,17 +329,18 @@ setup_fastapi_service() {
     mkdir -p "$FASTAPI_APP_DIR"
     chown -R "$MLOPS_USER:$MLOPS_GROUP" "$FASTAPI_APP_DIR"
 
+    # FIX: After=vault.service + Requires=vault.service
     cat > /etc/systemd/system/mlops-api.service << EOF
 [Unit]
 Description=MLOps Churn Prediction API (FastAPI)
-After=network.target mlflow-server.service
-Wants=vault.service
+After=network.target mlflow-server.service vault.service
+Requires=vault.service
 
 [Service]
-ExecStartPre=/usr/local/bin/fetch_secrets.sh fastapi
 Environment=VAULT_ADDR=http://127.0.0.1:8200
 Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/fastapi/credentials
 Environment=PATH=${VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+ExecStartPre=/usr/local/bin/fetch_secrets.sh fastapi
 ExecStart=/bin/bash -c '\
     source \${SERVICE_SECRETS_FILE} && \
     ${VENV_PATH}/bin/uvicorn app:app --host 0.0.0.0 --port ${PORT_FASTAPI}'
@@ -396,6 +431,11 @@ main() {
         create_mlops_user
         setup_python_virtualenv
     fi
+
+    # tmpfiles.d debe ejecutarse DESPUÉS de crear el usuario mlops
+    # y ANTES de registrar los units (que necesitan que el dir exista
+    # en el primer arranque para que ExecStartPre= no falle).
+    setup_tmpfiles
 
     # Estas funciones solo registran units — son rápidas y seguras de re-ejecutar
     install_minio

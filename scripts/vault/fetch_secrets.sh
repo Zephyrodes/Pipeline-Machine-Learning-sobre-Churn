@@ -5,7 +5,8 @@
 #
 # systemd lo invoca como ExecStartPre= antes de arrancar cada servicio.
 # El directorio /run/mlops-secrets/ existe solo en memoria — se limpia en
-# cada reinicio del sistema.
+# cada reinicio del sistema (recreado por systemd-tmpfiles vía
+# /etc/tmpfiles.d/mlops-secrets.conf, generado por provision_vm.sh).
 #
 # Uso (llamado por systemd, no manualmente):
 #   /usr/local/bin/fetch_secrets.sh <servicio>
@@ -15,7 +16,7 @@
 set -euo pipefail
 
 SERVICE="${1:-}"
-VAULT_ADDR="http://127.0.0.1:8200"
+VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
 VAULT_KV_PATH="mlops"
 SECRETS_BASE_DIR="/run/mlops-secrets"
 APPROLE_DIR="/etc/mlops/vault-init"
@@ -68,38 +69,65 @@ export VAULT_TOKEN
 
 # ──────────────────────────────────────────────
 # Directorio de secretos en tmpfs (solo memoria)
+# El directorio padre /run/mlops-secrets existe gracias a tmpfiles.d
 # ──────────────────────────────────────────────
 SERVICE_SECRETS_DIR="$SECRETS_BASE_DIR/$SERVICE"
 mkdir -p "$SERVICE_SECRETS_DIR"
 chmod 700 "$SERVICE_SECRETS_DIR"
 
 # ──────────────────────────────────────────────
-# Leer secretos de Vault y exportar como archivo
-# El archivo es leído por el servicio via LoadCredential= de systemd
+# Helpers
 # ──────────────────────────────────────────────
+
+# Escribe las credenciales de un path KV en formato KEY=VALUE.
+# Usa un archivo temporal + rename atómico para evitar que el servicio
+# lea un archivo parcialmente escrito en caso de fallo.
 write_env_file() {
     local path="$1"
     local output_file="$SERVICE_SECRETS_DIR/credentials"
-    local secret_json
+    local tmp_file
+    tmp_file=$(mktemp "$SERVICE_SECRETS_DIR/.creds.XXXXXX")
 
-    secret_json=$(vault kv get -format=json "$path" | python3 -c "
+    vault kv get -format=json "$path" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)['data']['data']
 for k, v in data.items():
     print(f'{k.upper()}={v}')
-")
+" > "$tmp_file"
 
-    echo "$secret_json" > "$output_file"
-    chmod 600 "$output_file"
+    chmod 600 "$tmp_file"
+    mv "$tmp_file" "$output_file"
 }
 
-# Cada servicio lee su propio path + los de las dependencias que necesita
+# Igual que write_env_file pero recibe el contenido ya generado desde stdin.
+# FIX: en el original los bloques multi-servicio (mlflow, fastapi) escribían
+# con redirección directa al archivo de destino y aplicaban chmod 600 después,
+# dejando una ventana en la que otro proceso podía leer el archivo sin permisos.
+# Ahora se escribe a un tmp con permisos restrictivos y se renombra atómicamente.
+write_env_file_from_stdin() {
+    local output_file="$SERVICE_SECRETS_DIR/credentials"
+    local tmp_file
+    tmp_file=$(mktemp "$SERVICE_SECRETS_DIR/.creds.XXXXXX")
+    chmod 600 "$tmp_file"
+    cat > "$tmp_file"
+    mv "$tmp_file" "$output_file"
+}
+
+# ──────────────────────────────────────────────
+# Leer secretos de Vault y exportar como archivo.
+# El archivo es leído por el servicio via LoadCredential= de systemd
+# o mediante source ${SERVICE_SECRETS_FILE} en ExecStart=.
+# ──────────────────────────────────────────────
 case "$SERVICE" in
     minio)
         write_env_file "${VAULT_KV_PATH}/minio"
         ;;
+
     mlflow)
-        # MLflow necesita las credenciales de MinIO para acceder a los artefactos
+        # MLflow necesita sus propias credenciales + las de MinIO para artefactos.
+        # FIX: se construye todo el contenido en un subshell y se escribe de forma
+        # atómica vía write_env_file_from_stdin (antes el chmod se aplicaba después
+        # de la redirección, dejando el archivo legible con permisos incorrectos).
         {
             vault kv get -format=json "${VAULT_KV_PATH}/mlflow" | python3 -c "
 import sys, json
@@ -108,22 +136,22 @@ for k, v in data.items(): print(f'{k.upper()}={v}')
 "
             vault kv get -format=json "${VAULT_KV_PATH}/minio" | python3 -c "
 import sys, json
-data = json.load(sys.stdin)['data']['data']
-# Solo las claves de acceso, no todo el bloque de minio
-d = data
+d = json.load(sys.stdin)['data']['data']
 print(f'AWS_ACCESS_KEY_ID={d[\"root_user\"]}')
 print(f'AWS_SECRET_ACCESS_KEY={d[\"root_password\"]}')
 print(f'MLFLOW_S3_ENDPOINT_URL={d[\"endpoint\"]}')
 "
-        } > "$SERVICE_SECRETS_DIR/credentials"
-        chmod 600 "$SERVICE_SECRETS_DIR/credentials"
+        } | write_env_file_from_stdin
         ;;
+
     airflow)
         write_env_file "${VAULT_KV_PATH}/airflow"
-        # Agregar AIRFLOW__CORE__FERNET_KEY desde el campo fernet_key
+        # Renombrar FERNET_KEY → AIRFLOW__CORE__FERNET_KEY para que Airflow
+        # lo reconozca directamente al hacer source del archivo de credenciales
         sed -i 's/^FERNET_KEY=/AIRFLOW__CORE__FERNET_KEY=/' \
             "$SERVICE_SECRETS_DIR/credentials"
         ;;
+
     fastapi)
         {
             vault kv get -format=json "${VAULT_KV_PATH}/fastapi" | python3 -c "
@@ -133,12 +161,11 @@ for k, v in data.items(): print(f'{k.upper()}={v}')
 "
             vault kv get -format=json "${VAULT_KV_PATH}/minio" | python3 -c "
 import sys, json
-data = json.load(sys.stdin)['data']['data']
-print(f'AWS_ACCESS_KEY_ID={data[\"root_user\"]}')
-print(f'AWS_SECRET_ACCESS_KEY={data[\"root_password\"]}')
+d = json.load(sys.stdin)['data']['data']
+print(f'AWS_ACCESS_KEY_ID={d[\"root_user\"]}')
+print(f'AWS_SECRET_ACCESS_KEY={d[\"root_password\"]}')
 "
-        } > "$SERVICE_SECRETS_DIR/credentials"
-        chmod 600 "$SERVICE_SECRETS_DIR/credentials"
+        } | write_env_file_from_stdin
         ;;
 esac
 

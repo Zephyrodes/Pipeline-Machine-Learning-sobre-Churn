@@ -95,7 +95,7 @@ vault kv put "${VAULT_KV_PATH}/airflow" \
     admin_password="${AIRFLOW_ADMIN_PASSWORD}" \
     admin_email="${AIRFLOW_ADMIN_EMAIL}" \
     fernet_key="${AIRFLOW_FERNET_KEY}" \
-    home="${AIRFLOW_HOME:-/opt/airflow}"
+    airflow_home="${AIRFLOW_HOME:-/opt/airflow}"
 log_info "mlops/airflow escrito"
 
 vault kv put "${VAULT_KV_PATH}/mlflow" \

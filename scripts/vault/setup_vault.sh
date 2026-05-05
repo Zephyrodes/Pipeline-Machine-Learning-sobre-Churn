@@ -50,7 +50,6 @@ start_service() {
         systemctl start  "$service_name"
     else
         log_warn "systemd no disponible — arrancando $service_name como proceso directo"
-        # Arrancar en segundo plano y guardar PID
         nohup $exec_cmd >> "/var/log/${service_name}.log" 2>&1 &
         echo $! > "$pidfile"
         log_info "$service_name PID: $(cat $pidfile)"
@@ -68,6 +67,10 @@ VAULT_KEYS_DIR="/etc/mlops/vault-init"
 VAULT_KV_PATH="mlops"
 MLOPS_POLICY_NAME="mlops-services"
 VAULT_USER="vault"
+
+# FIX: grupo del usuario de servicio mlops. ExecStartPre= (fetch_secrets.sh)
+# corre con este usuario y necesita leer role_id y secret_id de cada servicio.
+MLOPS_GROUP="mlops"
 
 declare -A SERVICE_ROLES=(
     ["airflow"]="mlops-airflow"
@@ -108,7 +111,6 @@ https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
 configure_and_start_vault() {
     log_section "Configurando y arrancando Vault"
 
-    # Usuario del sistema
     if ! id "$VAULT_USER" &>/dev/null; then
         useradd --system --home "$VAULT_DATA_DIR" \
                 --shell /bin/false "$VAULT_USER"
@@ -164,7 +166,6 @@ WantedBy=multi-user.target
 EOF
         start_service "vault" ""
     else
-        # Contenedor: arrancar Vault directamente como proceso
         mkdir -p /var/log
         nohup su -s /bin/bash "$VAULT_USER" -c \
             "vault server -config=$VAULT_CONFIG_DIR/vault.hcl" \
@@ -173,7 +174,6 @@ EOF
         log_info "Vault arrancado como proceso (PID: $(cat /run/vault.pid))"
     fi
 
-    # Esperar a que Vault esté listo
     local retries=10
     until vault status &>/dev/null || [[ $retries -eq 0 ]]; do
         sleep 2
@@ -188,7 +188,6 @@ EOF
 initialize_vault() {
     log_section "Inicializando Vault"
 
-    # Si ya está inicializado, solo hacer unseal
     if vault status 2>/dev/null | grep -q "Initialized.*true"; then
         log_warn "Vault ya inicializado — procediendo al unseal"
         unseal_vault
@@ -196,7 +195,12 @@ initialize_vault() {
     fi
 
     mkdir -p "$VAULT_KEYS_DIR"
-    chmod 700 "$VAULT_KEYS_DIR"
+
+    # FIX: el directorio raíz vault-init necesita permisos de traversal para
+    # el grupo mlops (modo 710) para que los servicios puedan acceder a sus
+    # subdirectorios de credenciales AppRole, sin poder leer init.json (root token).
+    chmod 710 "$VAULT_KEYS_DIR"
+    chown root:"$MLOPS_GROUP" "$VAULT_KEYS_DIR"
 
     local init_output
     init_output=$(vault operator init \
@@ -205,7 +209,9 @@ initialize_vault() {
         -format=json)
 
     echo "$init_output" > "$VAULT_KEYS_DIR/init.json"
+    # init.json solo accesible por root — contiene unseal keys y root token
     chmod 600 "$VAULT_KEYS_DIR/init.json"
+    chown root:root "$VAULT_KEYS_DIR/init.json"
     log_warn "Unseal keys y root token guardados en $VAULT_KEYS_DIR/init.json"
     log_warn "Haz backup de este archivo y elimínalo del servidor en producción."
 
@@ -280,8 +286,26 @@ configure_approle() {
 
         echo "$role_id"   > "$role_dir/role_id"
         echo "$secret_id" > "$role_dir/secret_id"
-        chmod 644 "$role_dir/role_id"
-        chmod 600 "$role_dir/secret_id"
+
+        # FIX: los archivos deben ser legibles por el grupo mlops para que
+        # ExecStartPre= (fetch_secrets.sh corriendo como usuario mlops) pueda
+        # autenticarse con Vault. Con root:root + 600/644 el script fallaba con
+        # "Permission denied" al intentar leer secret_id.
+        #
+        # Árbol de permisos resultante:
+        #   /etc/mlops/vault-init/           root:mlops  710  (traversal sin lectura)
+        #   /etc/mlops/vault-init/init.json  root:root   600  (solo root)
+        #   /etc/mlops/vault-init/<svc>/     root:mlops  750  (mlops puede listar/leer)
+        #   /etc/mlops/vault-init/<svc>/role_id    root:mlops  640
+        #   /etc/mlops/vault-init/<svc>/secret_id  root:mlops  640
+        chown root:"$MLOPS_GROUP" "$role_dir"
+        chmod 750 "$role_dir"
+
+        chown root:"$MLOPS_GROUP" "$role_dir/role_id"
+        chmod 640 "$role_dir/role_id"
+
+        chown root:"$MLOPS_GROUP" "$role_dir/secret_id"
+        chmod 640 "$role_dir/secret_id"
 
         log_info "AppRole '$role_name' → $role_dir/"
     done

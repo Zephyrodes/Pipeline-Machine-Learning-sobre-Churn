@@ -163,7 +163,9 @@ cd Pipeline-Machine-Learning-sobre-Churn
 sudo ./scripts/provision_vm.sh
 ```
 
-Instala y levanta como servicios systemd: Vault, MinIO, MLflow, Airflow y FastAPI.
+Instala las dependencias del sistema, registra los servicios en systemd
+(MinIO, MLflow, Airflow, FastAPI) y configura el firewall.
+**No arranca los servicios** — eso ocurre después de configurar Vault.
 
 ### 3. Configurar Vault
 
@@ -171,11 +173,13 @@ Instala y levanta como servicios systemd: Vault, MinIO, MLflow, Airflow y FastAP
 sudo ./scripts/vault/setup_vault.sh
 ```
 
-Inicializa Vault, habilita el motor KV v2, crea la política `mlops-services`
-y genera un AppRole por servicio. Los `role_id` y `secret_id` se guardan en
-`/etc/mlops/vault-init/` con permisos `600`.
+Instala Vault, lo inicializa, habilita el motor KV v2, crea la política
+`mlops-services` y genera un AppRole por servicio. Las unseal keys y el
+root token se guardan en `/etc/mlops/vault-init/init.json` con permisos `600`.
 
 ### 4. Escribir los secretos en Vault
+
+Completa el `.env` con tus credenciales y ejecuta:
 
 ```bash
 sudo VAULT_TOKEN=$(python3 -c "import json; \
@@ -183,21 +187,19 @@ sudo VAULT_TOKEN=$(python3 -c "import json; \
   ./scripts/vault/write_secrets.sh
 ```
 
-El script solicita las credenciales de forma interactiva (sin exponerlas
-en argumentos de línea de comandos) y las escribe en los paths del KV:
+Lee el `.env` y escribe las credenciales en los paths del KV:
 `mlops/minio`, `mlops/airflow`, `mlops/mlflow`, `mlops/fastapi`.
 
 ### 5. Iniciar los servicios
 
 ```bash
-systemctl start minio mlflow-server airflow-webserver airflow-scheduler mlops-api
-systemctl status minio mlflow-server airflow-webserver airflow-scheduler mlops-api
+sudo systemctl start minio mlflow-server airflow-webserver airflow-scheduler mlops-api
+sudo systemctl status minio mlflow-server airflow-webserver airflow-scheduler mlops-api
 ```
 
-Cada servicio ejecuta `fetch_secrets.sh` como `ExecStartPre=`, que autentica
+Cada servicio ejecuta `fetch_secrets.sh` como `ExecStartPre=`, autentica
 con Vault via AppRole y deposita las credenciales en `/run/mlops-secrets/<servicio>/`
-(tmpfs). `LoadCredential=` las entrega al proceso sin que aparezcan en
-variables de entorno visibles.
+(tmpfs). `LoadCredential=` las entrega al proceso sin exponerlas en el entorno.
 
 ---
 
