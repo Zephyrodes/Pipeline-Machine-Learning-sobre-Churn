@@ -259,14 +259,46 @@ EOF
 }
 
 # ──────────────────────────────────────────────
+# Helpers de estado — consultan /v1/sys/health via HTTP para evitar
+# depender del exit code de `vault status`, que varía según el estado
+# de Vault y rompe `set -euo pipefail`:
+#
+#   exit 0 → unsealed y activo   (nunca ocurre justo tras arrancar)
+#   exit 1 → error de red
+#   exit 2 → sealed o no inicializado  ← esto mataba el script
+#
+# /v1/sys/health en cambio siempre responde con HTTP si el proceso vive:
+#   200 → activo y unsealed
+#   501 → no inicializado
+#   503 → sealed
+# ──────────────────────────────────────────────
+_vault_http_code() {
+    curl -s --max-time 3 -o /dev/null -w "%{http_code}" \
+        "${VAULT_ADDR}/v1/sys/health" 2>/dev/null || echo "000"
+}
+
+_vault_is_initialized() {
+    # 501 = no inicializado; cualquier otra respuesta = ya inicializado
+    local code
+    code=$(_vault_http_code)
+    [[ "$code" != "501" && "$code" != "000" ]]
+}
+
+_vault_is_sealed() {
+    # 503 = sealed; 200 = activo (unsealed)
+    local code
+    code=$(_vault_http_code)
+    [[ "$code" == "503" ]]
+}
+
+# ──────────────────────────────────────────────
 # 3. Inicialización y unseal
 # ──────────────────────────────────────────────
 initialize_vault() {
     log_section "Inicializando Vault"
 
-    if vault status 2>/dev/null | grep -q "Initialized.*true"; then
+    if _vault_is_initialized; then
         log_skip "Vault ya inicializado"
-        # Puede estar sealed tras un reinicio
         _unseal_if_needed
         return
     fi
@@ -302,7 +334,7 @@ initialize_vault() {
 
 # Hace unseal solo si Vault está sealed; no-op si ya está abierto.
 _unseal_if_needed() {
-    if vault status 2>/dev/null | grep -q "Sealed.*false"; then
+    if ! _vault_is_sealed; then
         log_skip "Vault ya está unsealed"
         return
     fi
