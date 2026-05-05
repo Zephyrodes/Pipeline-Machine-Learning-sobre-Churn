@@ -3,7 +3,7 @@
 # Inicializa DVC y configura el remote apuntando a MinIO.
 # Crea los buckets necesarios en MinIO usando el cliente mc.
 #
-# IDEMPOTENTE: cada paso verifica el estado actual antes de actuar.
+# Cada paso verifica el estado actual antes de actuar.
 #
 # Las credenciales se obtienen de HashiCorp Vault via AppRole (mismo mecanismo
 # que usan los servicios systemd). Vault debe estar inicializado y unsealed.
@@ -187,9 +187,40 @@ install_mc_client() {
 }
 
 # ──────────────────────────────────────────────
-# 3. Crear buckets en MinIO
+# 3. Esperar a que MinIO esté disponible
+#
+# dvc-setup corre antes de `make start` en el flujo de install,
+# así que MinIO puede no estar arrancado todavía. Esperamos hasta
+# 60 s antes de fallar con un mensaje accionable.
+# ──────────────────────────────────────────────
+_wait_for_minio() {
+    local endpoint="$1"
+    local retries=30   # 30 × 2 s = 60 s máximo
+    log_info "Esperando a que MinIO esté disponible en $endpoint..."
+
+    until curl -sf --max-time 2 "${endpoint}/minio/health/live"             -o /dev/null 2>/dev/null || [[ $retries -eq 0 ]]; do
+        sleep 2
+        (( retries-- )) || true
+    done
+
+    if ! curl -sf --max-time 2 "${endpoint}/minio/health/live" -o /dev/null 2>/dev/null; then
+        log_error "MinIO no responde en $endpoint después de 60 s"
+        log_error "  → Arráncalo primero:"
+        log_error "      sudo systemctl start minio"
+        log_error "  → O revisa los logs:"
+        log_error "      sudo journalctl -u minio -n 50 --no-pager"
+        exit 1
+    fi
+
+    log_info "MinIO disponible en $endpoint"
+}
+
+# ──────────────────────────────────────────────
+# 4. Crear buckets en MinIO
 # ──────────────────────────────────────────────
 create_minio_buckets() {
+    _wait_for_minio "$MINIO_ENDPOINT"
+
     log_info "Configurando alias mc → $MINIO_ENDPOINT"
     mc alias set local "$MINIO_ENDPOINT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" --quiet
 
@@ -204,7 +235,7 @@ create_minio_buckets() {
 }
 
 # ──────────────────────────────────────────────
-# 4. Inicializar DVC
+# 5. Inicializar DVC
 # ──────────────────────────────────────────────
 init_dvc() {
     if ! git rev-parse --is-inside-work-tree &>/dev/null; then
@@ -227,7 +258,7 @@ init_dvc() {
 }
 
 # ──────────────────────────────────────────────
-# 5. Configurar remote DVC
+# 6. Configurar remote DVC
 # .dvc/config       → URL y endpoint (versionado en git, sin credenciales)
 # .dvc/config.local → credenciales   (excluido de git por .dvc/.gitignore)
 # ──────────────────────────────────────────────
@@ -265,7 +296,7 @@ configure_dvc_remote() {
 }
 
 # ──────────────────────────────────────────────
-# 6. Estructura de directorios de datos
+# 7. Estructura de directorios de datos
 # ──────────────────────────────────────────────
 create_data_dirs() {
     local created=false
