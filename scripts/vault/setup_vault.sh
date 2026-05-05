@@ -81,15 +81,46 @@ _write_file_if_changed() {
     return 0
 }
 
-# Espera a que Vault responda (máx. 30 s).
+# Espera a que el listener TCP de Vault esté activo (máx. 60 s).
+#
+# Por qué NO usar `vault status`:
+#   - exit 0  → unsealed (imposible en el primer arranque)
+#   - exit 1  → error de red / proceso aún no levantó
+#   - exit 2  → sealed o no inicializado  ← estado normal justo tras arrancar
+#
+# Usar `vault status` como condición de espera nunca termina en primera
+# instalación porque el proceso arranca sealed. En su lugar comprobamos
+# que el puerto TCP 8200 acepta conexiones, que es lo único que necesitamos
+# saber antes de llamar a `vault operator init`.
 _wait_for_vault() {
-    local retries=15
-    until vault status &>/dev/null || [[ $retries -eq 0 ]]; do
+    local retries=30   # 30 × 2 s = 60 s máximo
+    log_info "Esperando a que Vault levante en $VAULT_ADDR..."
+    until curl -sf --max-time 2 "${VAULT_ADDR}/v1/sys/health" \
+            -o /dev/null 2>/dev/null \
+          || [[ $retries -eq 0 ]]; do
         sleep 2
         (( retries-- )) || true
     done
-    vault status &>/dev/null || { log_error "Vault no responde en $VAULT_ADDR"; exit 1; }
-    log_info "Vault accesible en $VAULT_ADDR"
+
+    # /v1/sys/health devuelve:
+    #   200 → activo y unsealed          (instalación previa)
+    #   429 → standby                    (HA, no aplica aquí)
+    #   472 → recovery mode
+    #   501 → no inicializado            ← estado normal en primer arranque
+    #   503 → sealed                     ← estado normal tras reinicio
+    # Cualquiera de estos códigos significa que el proceso responde.
+    # Solo falla si curl no pudo conectar en absoluto (exit ≠ 0 por red).
+    local http_code
+    http_code=$(curl -s --max-time 2 -o /dev/null -w "%{http_code}" \
+                    "${VAULT_ADDR}/v1/sys/health" 2>/dev/null || echo "000")
+
+    if [[ "$http_code" == "000" ]]; then
+        log_error "Vault no responde en $VAULT_ADDR después de 60 s"
+        log_error "Revisa los logs: journalctl -u vault  o  cat /var/log/vault.log"
+        exit 1
+    fi
+
+    log_info "Vault accesible en $VAULT_ADDR (HTTP $http_code)"
 }
 
 # ──────────────────────────────────────────────
