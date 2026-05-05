@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # =============================================================================
-# provision_vm.sh
 # Aprovisiona la VM e instala todos los servicios del pipeline MLOps.
 #
 # Gestión de secretos:
@@ -8,7 +7,6 @@
 #   fetch_secrets.sh como ExecStartPre=, que autentica con AppRole, obtiene
 #   las credenciales de Vault y las escribe en /run/mlops-secrets/<servicio>/
 #   (tmpfs — solo memoria, se limpia en cada reinicio).
-#   LoadCredential= los entrega al proceso sin exponerlos en el entorno.
 #
 # Paso 1 del despliegue — ejecutar antes que setup_vault.sh.
 #
@@ -139,16 +137,17 @@ install_minio() {
     cat > /etc/systemd/system/minio.service << EOF
 [Unit]
 Description=MinIO Object Storage
-After=network-online.target vault-unseal.service
+After=network-online.target
+Wants=vault.service
 
 [Service]
 # fetch_secrets.sh autentica con Vault via AppRole y escribe las credenciales
-# en ${SECRETS_BASE}/minio/credentials (tmpfs). LoadCredential= las entrega
 # al proceso sin exponerlas en variables de entorno visibles.
 ExecStartPre=/usr/local/bin/fetch_secrets.sh minio
-LoadCredential=credentials:${SECRETS_BASE}/minio/credentials
+Environment=VAULT_ADDR=http://127.0.0.1:8200
+Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/minio/credentials
 ExecStart=/bin/bash -c '\
-    source \${CREDENTIALS_DIR}/credentials && \
+    source \${SERVICE_SECRETS_FILE} && \
     MINIO_ROOT_USER=\${ROOT_USER} \
     MINIO_ROOT_PASSWORD=\${ROOT_PASSWORD} \
     /usr/local/bin/minio server \
@@ -184,14 +183,16 @@ install_mlflow() {
     cat > /etc/systemd/system/mlflow-server.service << EOF
 [Unit]
 Description=MLflow Tracking Server
-After=network.target minio.service vault-unseal.service
+After=network.target minio.service
+Wants=vault.service
 
 [Service]
 ExecStartPre=/usr/local/bin/fetch_secrets.sh mlflow
-LoadCredential=credentials:${SECRETS_BASE}/mlflow/credentials
+Environment=VAULT_ADDR=http://127.0.0.1:8200
+Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/mlflow/credentials
 Environment=PATH=${VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=/bin/bash -c '\
-    source \${CREDENTIALS_DIR}/credentials && \
+    source \${SERVICE_SECRETS_FILE} && \
     ${VENV_PATH}/bin/mlflow server \
         --backend-store-uri sqlite://${MLFLOW_HOME}/db/mlflow.db \
         --default-artifact-root s3://\${ARTIFACT_BUCKET:-mlflow-artifacts}/ \
@@ -233,15 +234,17 @@ create_airflow_systemd_services() {
     cat > /etc/systemd/system/airflow-webserver.service << EOF
 [Unit]
 Description=Apache Airflow Webserver
-After=network.target vault-unseal.service
+After=network.target
+Wants=vault.service
 
 [Service]
 ExecStartPre=/usr/local/bin/fetch_secrets.sh airflow
-LoadCredential=credentials:${SECRETS_BASE}/airflow/credentials
+Environment=VAULT_ADDR=http://127.0.0.1:8200
+Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/airflow/credentials
 Environment=AIRFLOW_HOME=${AIRFLOW_HOME}
 Environment=PATH=${VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=/bin/bash -c '\
-    source \${CREDENTIALS_DIR}/credentials && \
+    source \${SERVICE_SECRETS_FILE} && \
     ${VENV_PATH}/bin/airflow webserver --port ${PORT_AIRFLOW_WEBSERVER}'
 User=${MLOPS_USER}
 Group=${MLOPS_GROUP}
@@ -257,15 +260,17 @@ EOF
     cat > /etc/systemd/system/airflow-scheduler.service << EOF
 [Unit]
 Description=Apache Airflow Scheduler
-After=network.target vault-unseal.service
+After=network.target
+Wants=vault.service
 
 [Service]
 ExecStartPre=/usr/local/bin/fetch_secrets.sh airflow
-LoadCredential=credentials:${SECRETS_BASE}/airflow/credentials
+Environment=VAULT_ADDR=http://127.0.0.1:8200
+Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/airflow/credentials
 Environment=AIRFLOW_HOME=${AIRFLOW_HOME}
 Environment=PATH=${VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=/bin/bash -c '\
-    source \${CREDENTIALS_DIR}/credentials && \
+    source \${SERVICE_SECRETS_FILE} && \
     ${VENV_PATH}/bin/airflow scheduler'
 User=${MLOPS_USER}
 Group=${MLOPS_GROUP}
@@ -293,14 +298,16 @@ setup_fastapi_service() {
     cat > /etc/systemd/system/mlops-api.service << EOF
 [Unit]
 Description=MLOps Churn Prediction API (FastAPI)
-After=network.target mlflow-server.service vault-unseal.service
+After=network.target mlflow-server.service
+Wants=vault.service
 
 [Service]
 ExecStartPre=/usr/local/bin/fetch_secrets.sh fastapi
-LoadCredential=credentials:${SECRETS_BASE}/fastapi/credentials
+Environment=VAULT_ADDR=http://127.0.0.1:8200
+Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/fastapi/credentials
 Environment=PATH=${VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=/bin/bash -c '\
-    source \${CREDENTIALS_DIR}/credentials && \
+    source \${SERVICE_SECRETS_FILE} && \
     ${VENV_PATH}/bin/uvicorn app:app --host 0.0.0.0 --port ${PORT_FASTAPI}'
 User=${MLOPS_USER}
 Group=${MLOPS_GROUP}
@@ -327,7 +334,7 @@ install_ml_dependencies() {
     pip install \
         dvc[s3]==3.51.2 scikit-learn==1.5.1 pandas==2.2.2 numpy==1.26.4 \
         fastapi==0.112.0 uvicorn[standard]==0.30.5 pydantic==2.8.2 \
-        boto3==1.35.0 pyarrow==17.0.0 joblib==1.4.2 matplotlib==3.9.2 \
+        boto3==1.35.0 pyarrow==15.0.2 joblib==1.4.2 matplotlib==3.9.2 \
         python-multipart==0.0.9
 }
 
@@ -370,25 +377,37 @@ print_summary() {
     echo -e "  Orden de pasos siguientes:"
     echo -e "  1. sudo ./scripts/vault/setup_vault.sh"
     echo -e "  2. sudo VAULT_TOKEN=<token> ./scripts/vault/write_secrets.sh"
-    echo -e "  3. systemctl start minio mlflow-server airflow-webserver airflow-scheduler mlops-api"
+    echo -e "  3. sudo systemctl start minio mlflow-server airflow-webserver airflow-scheduler mlops-api"
 }
 
 # ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 main() {
+    local only_units=false
+    [[ "${1:-}" == "--only-units" ]] && only_units=true
+
     check_root
     detect_os
     install_fetch_secrets
-    install_base_packages
-    create_mlops_user
-    setup_python_virtualenv
+
+    if ! $only_units; then
+        install_base_packages
+        create_mlops_user
+        setup_python_virtualenv
+    fi
+
+    # Estas funciones solo registran units — son rápidas y seguras de re-ejecutar
     install_minio
     install_mlflow
     install_airflow
     install_ml_dependencies
     setup_fastapi_service
-    configure_firewall
+
+    if ! $only_units; then
+        configure_firewall
+    fi
+
     start_all_services
     print_summary
 }
