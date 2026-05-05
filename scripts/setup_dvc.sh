@@ -3,7 +3,7 @@
 # Inicializa DVC y configura el remote apuntando a MinIO.
 # Crea los buckets necesarios en MinIO usando el cliente mc.
 #
-# Cada paso verifica el estado actual antes de actuar.
+# IDEMPOTENTE: cada paso verifica el estado actual antes de actuar.
 #
 # Las credenciales se obtienen de HashiCorp Vault via AppRole (mismo mecanismo
 # que usan los servicios systemd). Vault debe estar inicializado y unsealed.
@@ -39,56 +39,58 @@ VENV_PATH="${VENV_PATH:-/opt/mlops_venv}"
 export VAULT_ADDR
 
 # ──────────────────────────────────────────────
-# Diagnóstico de acceso a credenciales AppRole
+# Auto-escalación a root
 #
-# El directorio /etc/mlops/vault-init/ tiene permisos 710 root:mlops,
-# y los subdirectorios de cada servicio tienen 750 root:mlops.
-# Si el usuario actual no pertenece al grupo mlops, los archivos
-# son inaccesibles aunque existan.
+# /etc/mlops/vault-init/ es 710 root:mlops. Si el usuario actual no
+# pertenece al grupo mlops, los tests -e/-r fallan con "permission denied"
+# — bash los trata como "no existe", produciendo mensajes confusos.
+#
+# En lugar de requerir que el operador recuerde añadir su usuario al grupo,
+# el script detecta si necesita más privilegios y se relanza con sudo
+# preservando las variables de entorno relevantes.
 # ──────────────────────────────────────────────
+_ensure_privileged() {
+    # Si ya somos root no hay nada que hacer
+    [[ "$EUID" -eq 0 ]] && return
+
+    # Comprobamos acceso real usando sudo test (no expone el contenido)
+    if ! sudo test -r "$APPROLE_DIR/role_id" 2>/dev/null; then
+        log_error "No se puede acceder a $APPROLE_DIR/role_id ni con sudo."
+        log_error "  → Ejecuta primero: sudo ./scripts/vault/setup_vault.sh"
+        exit 1
+    fi
+
+    # Tenemos sudo pero no somos root — relanzar el script completo elevado,
+    # preservando las variables que el usuario pudo haber sobreescrito.
+    log_warn "Usuario \'$(id -un)\' no pertenece al grupo mlops — relanzando con sudo..."
+    exec sudo \
+        VAULT_ADDR="$VAULT_ADDR" \
+        VENV_PATH="$VENV_PATH" \
+        HOME="$HOME" \
+        GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-}" \
+        GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-}" \
+        bash "$0" "$@"
+}
+
 _check_approle_access() {
     local role_id_file="$APPROLE_DIR/role_id"
     local secret_id_file="$APPROLE_DIR/secret_id"
 
-    # ¿Existe el directorio?
+    # En este punto somos root (garantizado por _ensure_privileged),
+    # por lo que -e y -r funcionan sin ambigüedad de permisos.
+
     if [[ ! -e "$APPROLE_DIR" ]]; then
         log_error "Directorio AppRole no encontrado: $APPROLE_DIR"
         log_error "  → Ejecuta primero: sudo ./scripts/vault/setup_vault.sh"
         return 1
     fi
 
-    # ¿Es accesible (el usuario tiene permisos de traversal)?
-    if [[ ! -x "$APPROLE_DIR" ]]; then
-        log_error "Sin permiso de acceso a $APPROLE_DIR"
-        log_error "  → Usuario actual: $(id)"
-        log_error "  → Propietario del dir: $(stat -c '%U:%G %a' "$APPROLE_DIR")"
-        log_error "  → Solución: añade tu usuario al grupo mlops:"
-        log_error "      sudo usermod -aG mlops \$USER   # luego cierra y abre sesión"
-        log_error "    o ejecuta este script con sudo."
-        return 1
-    fi
-
-    # ¿Existen los archivos?
     local missing=()
     [[ ! -e "$role_id_file"   ]] && missing+=("role_id")
     [[ ! -e "$secret_id_file" ]] && missing+=("secret_id")
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_error "Archivos AppRole faltantes en $APPROLE_DIR: ${missing[*]}"
         log_error "  → Ejecuta primero: sudo ./scripts/vault/setup_vault.sh"
-        return 1
-    fi
-
-    # ¿Son legibles?
-    local unreadable=()
-    [[ ! -r "$role_id_file"   ]] && unreadable+=("role_id")
-    [[ ! -r "$secret_id_file" ]] && unreadable+=("secret_id")
-    if [[ ${#unreadable[@]} -gt 0 ]]; then
-        log_error "Archivos AppRole existen pero no son legibles: ${unreadable[*]}"
-        log_error "  → Usuario actual: $(id)"
-        log_error "  → Permisos: $(stat -c '%U:%G %a' "$role_id_file")"
-        log_error "  → Solución: añade tu usuario al grupo mlops:"
-        log_error "      sudo usermod -aG mlops \$USER   # luego cierra y abre sesión"
-        log_error "    o ejecuta este script con sudo."
         return 1
     fi
 
@@ -307,6 +309,7 @@ GITIGNORE
 # Main
 # ──────────────────────────────────────────────
 main() {
+    _ensure_privileged "$@"   # relanza como root si el usuario no es del grupo mlops
     activate_venv
     fetch_minio_credentials
     install_mc_client
