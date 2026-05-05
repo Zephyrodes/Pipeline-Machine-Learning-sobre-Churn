@@ -40,11 +40,11 @@ FastAPI administrado por systemd.
 └──────────┬──────────────────────────────────────────────┘
            │  fetch_secrets.sh (ExecStartPre=)
            │  AppRole auth → credenciales en tmpfs
-           │  LoadCredential= → proceso (nunca en /proc)
+           │  source credentials → proceso
            ▼
 ┌──────────────────────────────────────────────────────────┐
 │  Pipeline MLOps                                          │
-│                                                          │
+│                                                         │
 │  Fuente CSV                                              │
 │      │                                                   │
 │      ▼                                                   │
@@ -75,11 +75,22 @@ Vault KV v2
 fetch_secrets.sh          ← ExecStartPre= de cada unit systemd
     │
     │  escribe en /run/mlops-secrets/<servicio>/  (tmpfs)
+    │  recreado en cada arranque por systemd-tmpfiles
     ▼
-LoadCredential=           ← systemd entrega al proceso via CREDENTIALS_DIR
+source credentials        ← ExecStart= lee y exporta las variables
     │
     ▼
 minio / mlflow / airflow / fastapi
+```
+
+### Árbol de permisos de Vault
+
+```
+/etc/mlops/vault-init/              root:mlops  710  ← traversal sin listar
+/etc/mlops/vault-init/init.json     root:root   600  ← solo root (unseal keys + root token)
+/etc/mlops/vault-init/<servicio>/   root:mlops  750  ← mlops puede leer
+/etc/mlops/vault-init/<servicio>/role_id        640
+/etc/mlops/vault-init/<servicio>/secret_id      640
 ```
 
 ---
@@ -129,9 +140,10 @@ Pipeline-Machine-Learning-sobre-Churn/
 │   └── test_pipeline.py
 ├── data/
 │   ├── raw/
-│   │   └── CustomerChurn.csv       # Excluido de git — versionado con DVC
-│   └── processed/                  # Generado por el pipeline (Parquet)
-├── .env                            # Rellenar y cargar en Vault (excluido de git)
+│   │   └── CustomerChurn.csv     # Excluido de git — versionado con DVC
+│   └── processed/                # Generado por el pipeline (Parquet)
+├── Makefile                      # Punto de entrada único para despliegue y operación
+├── .env                          # Rellenar y cargar en Vault (excluido de git)
 ├── .gitignore
 ├── requirements.txt
 └── README.md
@@ -150,67 +162,76 @@ Pipeline-Machine-Learning-sobre-Churn/
 
 ## Instalación
 
-### 1. Clonar el repositorio
+El proyecto usa `make` como punto de entrada único. Gestiona los permisos de los
+scripts, el orden de ejecución y las llamadas a `sudo` automáticamente.
+
+### Despliegue completo
 
 ```bash
 git clone https://github.com/Zephyrodes/Pipeline-Machine-Learning-sobre-Churn.git
 cd Pipeline-Machine-Learning-sobre-Churn
+nano .env        # completar con los valores reales
+make install
 ```
 
-### 2. Aprovisionar la VM
+`make install` ejecuta en orden: permisos → aprovisionamiento → Vault → secretos → DVC → arranque de servicios.
+
+### Pasos individuales
+
+Si se necesita ejecutar una etapa por separado:
 
 ```bash
-sudo ./scripts/provision_vm.sh
+make permissions      # dar permisos de ejecución a todos los scripts
+make provision        # instalar dependencias y registrar servicios systemd
+make vault-setup      # instalar y configurar HashiCorp Vault
+make vault-secrets    # cargar el .env en Vault
+make dvc-setup        # inicializar DVC y crear buckets en MinIO
+make start            # arrancar todos los servicios
 ```
-
-Instala las dependencias del sistema, registra los servicios en systemd
-(MinIO, MLflow, Airflow, FastAPI) y configura el firewall.
-**No arranca los servicios** — eso ocurre después de configurar Vault.
-
-### 3. Configurar Vault
 
 ```bash
-sudo ./scripts/vault/setup_vault.sh
+make status           # estado de los servicios
+make logs             # logs en tiempo real
+make restart          # reiniciar todos los servicios
+make test             # ejecutar suite de tests
+make help             # ver todos los comandos disponibles
 ```
 
-Instala Vault, lo inicializa, habilita el motor KV v2, crea la política
-`mlops-services` y genera un AppRole por servicio. Las unseal keys y el
-root token se guardan en `/etc/mlops/vault-init/init.json` con permisos `600`.
+### Detalle de cada paso
 
-### 4. Escribir los secretos en Vault
+**`make provision`** — instala Python 3.12, dependencias del sistema y del proyecto,
+registra los servicios en systemd (MinIO, MLflow, Airflow, FastAPI) y configura
+el firewall. No arranca los servicios.
 
-Completa el `.env` con tus credenciales y ejecuta:
+**`make vault-setup`** — instala Vault, lo inicializa, habilita el motor KV v2,
+crea la política `mlops-services` y genera un AppRole por servicio. Las unseal keys
+y el root token se guardan en `/etc/mlops/vault-init/init.json` (`chmod 600`,
+propietario `root:root`). Los archivos `role_id` y `secret_id` de cada servicio
+quedan con propietario `root:mlops` y permisos `640` para que `ExecStartPre=`
+pueda leerlos.
 
-```bash
-sudo VAULT_TOKEN=$(python3 -c "import json; \
-  print(json.load(open('/etc/mlops/vault-init/init.json'))['root_token'])") \
-  ./scripts/vault/write_secrets.sh
-```
+**`make vault-secrets`** — lee el `.env` y escribe las credenciales en los paths
+del KV: `mlops/minio`, `mlops/airflow`, `mlops/mlflow`, `mlops/fastapi`. Lee
+`init.json` con privilegios de root internamente para evitar el `PermissionError`.
 
-Lee el `.env` y escribe las credenciales en los paths del KV:
-`mlops/minio`, `mlops/airflow`, `mlops/mlflow`, `mlops/fastapi`.
-
-### 5. Iniciar los servicios
-
-```bash
-sudo systemctl start minio mlflow-server airflow-webserver airflow-scheduler mlops-api
-sudo systemctl status minio mlflow-server airflow-webserver airflow-scheduler mlops-api
-```
-
-Cada servicio ejecuta `fetch_secrets.sh` como `ExecStartPre=`, autentica
-con Vault via AppRole y deposita las credenciales en `/run/mlops-secrets/<servicio>/`
-(tmpfs). `LoadCredential=` las entrega al proceso sin exponerlas en el entorno.
+**`make start`** — arranca los cinco servicios. Cada uno ejecuta `fetch_secrets.sh`
+como `ExecStartPre=`, autentica con Vault via AppRole y deposita las credenciales
+en `/run/mlops-secrets/<servicio>/credentials` (tmpfs). `LoadCredential=` las
+entrega al proceso sin exponerlas en variables de entorno visibles.
 
 ---
 
 ## Configuración de DVC
 
 ```bash
-./scripts/setup_dvc.sh
+make dvc-setup
 ```
 
 Crea los buckets `dvc-data` y `mlflow-artifacts` en MinIO, inicializa DVC y
 configura el remote. Las credenciales quedan en `.dvc/config.local`, excluido de git.
+
+> `setup_dvc.sh` no requiere `sudo` — autentica con Vault via AppRole
+> usando las credenciales del usuario `mlops`.
 
 ### Dataset
 
