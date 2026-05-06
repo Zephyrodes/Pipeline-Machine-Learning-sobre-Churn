@@ -270,8 +270,18 @@ create_minio_buckets() {
         if mc ls "local/$bucket" &>/dev/null; then
             log_skip "Bucket '$bucket' ya existe"
         else
-            mc mb "local/$bucket" --quiet
-            log_info "Bucket s3://$bucket creado"
+            # mc mb falla con exit != 0 si el bucket ya existe en MinIO
+            # (p.ej. creado en un run anterior con estado interno corrupto).
+            # Patrón defensivo: intentar crear → si falla, re-verificar si
+            # existe → solo abortar si tampoco existe tras el intento.
+            if mc mb "local/$bucket" --quiet; then
+                log_info "Bucket s3://$bucket creado"
+            elif mc ls "local/$bucket" &>/dev/null; then
+                log_skip "Bucket '$bucket' ya existe (detectado tras intento de creación)"
+            else
+                log_error "No se pudo crear ni verificar el bucket '$bucket'"
+                exit 1
+            fi
         fi
     done
 }
@@ -296,6 +306,15 @@ init_dvc() {
         dvc init
         git add .dvc/ .dvcignore
         git commit -m "chore: inicializar DVC"
+    fi
+
+    # Activa autostage: DVC hace `git add` del .dvc file automáticamente
+    # tras cada `dvc add`, evitando el error "pathspec did not match any files"
+    if [[ "$(dvc config core.autostage 2>/dev/null)" != "true" ]]; then
+        dvc config core.autostage true
+        log_info "DVC autostage activado"
+    else
+        log_skip "DVC autostage ya activado"
     fi
 }
 
@@ -381,6 +400,52 @@ GITIGNORE
 # ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# 8. Corregir ownership de .dvc/
+#
+# setup_dvc.sh corre como root. Si dvc init creó .dvc/ bajo root,
+# el usuario operador no puede escribir en .dvc/tmp/lock al ejecutar
+# `dvc add`. Se transfiere el ownership al usuario que invocó sudo.
+# ──────────────────────────────────────────────
+fix_dvc_ownership() {
+    local operator="${SUDO_USER:-}"
+
+    if [[ -z "$operator" ]]; then
+        log_skip "No se detectó SUDO_USER — ownership sin cambios"
+        return
+    fi
+
+    # Directorios que setup_dvc.sh puede haber creado como root:
+    #   .git/   → git init
+    #   .dvc/   → dvc init
+    #   data/   → create_data_dirs
+    #   models/ → create_data_dirs
+    local dirs=()
+    [[ -d ".git"    ]] && dirs+=(".git")
+    [[ -d ".dvc"    ]] && dirs+=(".dvc")
+    [[ -d "data"    ]] && dirs+=("data")
+    [[ -d "models"  ]] && dirs+=("models")
+
+    if [[ ${#dirs[@]} -eq 0 ]]; then
+        return
+    fi
+
+    local changed=false
+    for dir in "${dirs[@]}"; do
+        local current_owner
+        current_owner=$(stat -c '%U' "$dir" 2>/dev/null || echo "unknown")
+        if [[ "$current_owner" != "$operator" ]]; then
+            log_info "Transfiriendo ownership de $dir/ → $operator"
+            chown -R "$operator":"$operator" "$dir"
+            changed=true
+        else
+            log_skip "$dir/ ya pertenece a $operator"
+        fi
+    done
+
+    $changed && log_info "Ownership corregido — puedes ejecutar 'dvc add' y 'make data-add' sin sudo"
+}
+
 main() {
     _ensure_privileged "$@"   # relanza como root si el usuario no es del grupo mlops
     activate_venv
@@ -390,14 +455,14 @@ main() {
     init_dvc
     configure_dvc_remote
     create_data_dirs
+    fix_dvc_ownership
 
     echo ""
     log_info "DVC configurado correctamente"
     echo ""
     echo "  Próximos pasos:"
-    echo "  1. Coloca tu CSV en data/raw/telco_churn.csv"
-    echo "  2. dvc add data/raw/telco_churn.csv"
-    echo "  3. dvc push"
+    echo "  1. Coloca tu CSV en data/raw/CustomerChurn.csv"
+    echo "  2. make data-add"
 }
 
 main "$@"

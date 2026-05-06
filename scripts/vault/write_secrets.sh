@@ -23,7 +23,9 @@ log_info()  { echo -e "${GREEN}[VAULT-WRITE]${NC} $*"; }
 log_warn()  { echo -e "${YELLOW}[VAULT-WRITE]${NC} $*"; }
 log_error() { echo -e "${RED}[VAULT-WRITE]${NC} $*"; }
 
-VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
+# VAULT_ADDR se fija siempre a HTTP para evitar que sudo limpie la variable
+# y Vault use su default HTTPS (la VM solo expone listener HTTP en loopback).
+VAULT_ADDR="http://127.0.0.1:8200"
 VAULT_KV_PATH="mlops"
 export VAULT_ADDR
 

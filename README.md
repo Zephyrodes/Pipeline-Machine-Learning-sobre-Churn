@@ -74,6 +74,8 @@ Vault KV v2
     ▼
 fetch_secrets.sh          ← ExecStartPre= de cada unit systemd
     │
+    │  VAULT_ADDR fijado a http://127.0.0.1:8200 (siempre HTTP,
+    │  independiente del entorno heredado por sudo)
     │  escribe en /run/mlops-secrets/<servicio>/  (tmpfs)
     │  recreado en cada arranque por systemd-tmpfiles
     ▼
@@ -174,34 +176,37 @@ nano .env        # completar con los valores reales
 make install
 ```
 
-`make install` ejecuta en orden: permisos → aprovisionamiento → Vault → secretos → DVC → arranque de servicios.
+`make install` ejecuta en orden: permisos → aprovisionamiento → Vault → secretos → usuario admin de Airflow → MinIO → DVC → arranque de servicios.
 
 ### Pasos individuales
 
 Si se necesita ejecutar una etapa por separado:
 
 ```bash
-make permissions      # dar permisos de ejecución a todos los scripts
-make provision        # instalar dependencias y registrar servicios systemd
-make vault-setup      # instalar y configurar HashiCorp Vault
-make vault-secrets    # cargar el .env en Vault
-make dvc-setup        # inicializar DVC y crear buckets en MinIO
-make start            # arrancar todos los servicios
+make permissions           # dar permisos de ejecución a todos los scripts
+make provision             # instalar dependencias, registrar servicios systemd, configurar PATH y AIRFLOW_HOME
+make vault-setup           # instalar y configurar HashiCorp Vault
+make vault-secrets         # cargar el .env en Vault
+make airflow-create-admin  # crear el usuario admin de Airflow leyendo credenciales desde Vault
+make dvc-setup             # inicializar DVC, crear buckets en MinIO y corregir ownership
+make start                 # arrancar todos los servicios (con auto-recovery del lock de Vault)
 ```
 
 ```bash
 make status           # estado de los servicios
 make logs             # logs en tiempo real
 make restart          # reiniciar todos los servicios
-make test             # ejecutar suite de tests
+make test             # ejecutar suite de tests (usa pytest del venv directamente)
+make data-add         # versionar dataset con DVC y hacer push a MinIO
 make help             # ver todos los comandos disponibles
 ```
 
 ### Detalle de cada paso
 
 **`make provision`** — instala Python 3.12, dependencias del sistema y del proyecto,
-registra los servicios en systemd (MinIO, MLflow, Airflow, FastAPI) y configura
-el firewall. No arranca los servicios.
+registra los servicios en systemd (MinIO, MLflow, Airflow, FastAPI), configura
+el firewall y añade el venv (`/opt/mlops_venv/bin`) al `PATH` del usuario operador
+en `~/.bashrc`, junto con `AIRFLOW_HOME=/opt/airflow`. No arranca los servicios.
 
 **`make vault-setup`** — instala Vault, lo inicializa, habilita el motor KV v2,
 crea la política `mlops-services` y genera un AppRole por servicio. Las unseal keys
@@ -211,13 +216,29 @@ quedan con propietario `root:mlops` y permisos `640` para que `ExecStartPre=`
 pueda leerlos.
 
 **`make vault-secrets`** — lee el `.env` y escribe las credenciales en los paths
-del KV: `mlops/minio`, `mlops/airflow`, `mlops/mlflow`, `mlops/fastapi`. Lee
-`init.json` con privilegios de root internamente para evitar el `PermissionError`.
+del KV: `mlops/minio`, `mlops/airflow`, `mlops/mlflow`, `mlops/fastapi`. Pasa
+`VAULT_ADDR=http://127.0.0.1:8200` explícitamente al invocar `sudo` para evitar
+que Vault use su default HTTPS contra el listener HTTP de la VM.
 
-**`make start`** — arranca los cinco servicios. Cada uno ejecuta `fetch_secrets.sh`
-como `ExecStartPre=`, autentica con Vault via AppRole y deposita las credenciales
-en `/run/mlops-secrets/<servicio>/credentials` (tmpfs). `LoadCredential=` las
-entrega al proceso sin exponerlas en variables de entorno visibles.
+**`make airflow-create-admin`** — lee las credenciales de `mlops/airflow` en Vault
+y crea el usuario admin de Airflow en la base de datos de `/opt/airflow`. Es
+idempotente: si el usuario ya existe no falla. Debe ejecutarse después de
+`vault-secrets` y antes o después de arrancar `airflow-webserver`. No forma parte
+de `provision` porque en ese momento Vault aún no existe.
+
+**`make start`** — arranca los cinco servicios. Antes de hacerlo, ejecuta
+`vault-unseal` que detecta y recupera automáticamente el lock de BoltDB de Raft
+si Vault falló al arrancar (error `failed to open bolt file: timeout`). Cada
+servicio ejecuta `fetch_secrets.sh` como `ExecStartPre=`, autentica con Vault
+via AppRole y deposita las credenciales en `/run/mlops-secrets/<servicio>/credentials`
+(tmpfs). `VAULT_ADDR` se fija a HTTP dentro de cada script para que funcione
+correctamente aunque `sudo` limpie el entorno.
+
+> **Nota sobre `AIRFLOW_HOME`:** los comandos de administración de Airflow (`airflow users list`,
+> `airflow dags list`, etc.) deben ejecutarse con `AIRFLOW_HOME=/opt/airflow` apuntando
+> al mismo directorio que usa el servicio systemd. `make provision` escribe esta variable
+> en `~/.bashrc` del usuario operador; para la sesión actual ejecuta `source ~/.bashrc`
+> o bien `export AIRFLOW_HOME=/opt/airflow`.
 
 ---
 
@@ -229,24 +250,20 @@ make dvc-setup
 
 Crea los buckets `dvc-data` y `mlflow-artifacts` en MinIO, inicializa DVC y
 configura el remote. Las credenciales quedan en `.dvc/config.local`, excluido de git.
-
-> `setup_dvc.sh` no requiere `sudo` — autentica con Vault via AppRole
-> usando las credenciales del usuario `mlops`.
+Activa `core.autostage` y corrige el ownership de `.git/`, `.dvc/`, `data/` y `models/`
+para que el usuario operador pueda ejecutar comandos DVC sin `sudo`.
 
 ### Dataset
 
-Coloca el archivo `CustomerChurn.csv` en `data/raw/`:
+Coloca el archivo `CustomerChurn.csv` en `data/raw/` y versiona con un solo comando:
 
 ```bash
 cp /ruta/a/tu/CustomerChurn.csv data/raw/CustomerChurn.csv
+make data-add
 ```
 
-```bash
-dvc add data/raw/CustomerChurn.csv
-git add data/raw/CustomerChurn.csv.dvc data/raw/.gitignore
-git commit -m "data: IBM CustomerChurn dataset v1"
-dvc push
-```
+`make data-add` ejecuta en orden: `dvc add` → `git commit` → `dvc push` a MinIO.
+Para un CSV en ruta diferente: `make data-add CSV=data/raw/otro.csv`
 
 ---
 

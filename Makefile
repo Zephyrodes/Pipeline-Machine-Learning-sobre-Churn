@@ -11,6 +11,9 @@ SHELL := /bin/bash
 SCRIPTS_DIR := scripts
 VAULT_DIR   := scripts/vault
 
+# Ruta del entorno virtual del proyecto
+VENV_BIN := /opt/mlops_venv/bin
+
 # Silencia el warning de gosnowflake/dbus que aparece en cada invocación
 # de `vault` cuando no hay sesión de escritorio activa (servidor headless).
 export DBUS_SESSION_BUS_ADDRESS ?= /dev/null
@@ -20,8 +23,8 @@ GREEN  := \033[0;32m
 YELLOW := \033[1;33m
 NC     := \033[0m
 
-.PHONY: help install provision vault-setup vault-unseal vault-secrets dvc-setup \
-        start-minio start stop status restart logs test clean permissions
+.PHONY: help install provision configure-env vault-setup vault-unseal vault-secrets \
+        airflow-create-admin dvc-setup start-minio start stop status restart logs test clean permissions data-add
 
 # ──────────────────────────────────────────────
 # Ayuda
@@ -36,10 +39,12 @@ help:
 	@echo "  Pasos individuales:"
 	@echo "    make permissions      → dar permisos de ejecución a todos los scripts"
 	@echo "    make provision        → instalar dependencias y registrar servicios"
+	@echo "    make configure-env    → añadir el venv al PATH del usuario operador"
 	@echo "    make vault-setup      → instalar y configurar HashiCorp Vault"
 	@echo "    make vault-unseal     → desellar Vault si está sealed (safe re-run)"
-	@echo "    make vault-secrets    → cargar secretos del .env en Vault"
-	@echo "    make dvc-setup        → inicializar DVC y crear buckets en MinIO"
+	@echo "    make vault-secrets         → cargar secretos del .env en Vault"
+	@echo "    make airflow-create-admin  → crear usuario admin de Airflow (post-Vault)"
+	@echo "    make dvc-setup             → inicializar DVC y crear buckets en MinIO"
 	@echo ""
 	@echo "  Operación:"
 	@echo "    make start            → arrancar todos los servicios"
@@ -47,6 +52,9 @@ help:
 	@echo "    make restart          → reiniciar todos los servicios"
 	@echo "    make status           → estado de todos los servicios"
 	@echo "    make logs             → ver logs en tiempo real"
+	@echo ""
+	@echo "  Datos:"
+	@echo "    make data-add         → versionar el dataset con DVC y hacer push a MinIO"
 	@echo ""
 	@echo "  Desarrollo:"
 	@echo "    make test             → ejecutar suite de tests"
@@ -65,7 +73,8 @@ permissions:
 # Despliegue completo en orden
 #
 # Orden crítico:
-#   1. provision      → instala binarios y registra units systemd
+#   1. provision      → instala binarios, registra units systemd
+#                       y configura el PATH del venv en .bashrc
 #   2. vault-setup    → instala Vault, lo inicializa y configura AppRoles
 #   3. vault-secrets  → escribe los secretos del .env en Vault
 #   4. vault-unseal   → garantiza que Vault está unsealed justo antes
@@ -81,10 +90,15 @@ install: permissions
 	@$(MAKE) vault-secrets
 	@$(MAKE) vault-unseal
 	@$(MAKE) start-minio
+	@$(MAKE) airflow-create-admin
 	@$(MAKE) dvc-setup
 	@$(MAKE) start
 	@echo ""
 	@echo -e "$(GREEN)[MAKE]$(NC) Despliegue completo. Ejecuta 'make status' para verificar."
+	@echo ""
+	@echo -e "$(YELLOW)[NOTE]$(NC) Para activar el PATH del venv en esta sesión ejecuta:"
+	@echo -e "         source ~/.bashrc"
+	@echo -e "         Las próximas sesiones SSH lo tendrán activo automáticamente."
 
 # ──────────────────────────────────────────────
 # Pasos individuales
@@ -92,14 +106,78 @@ install: permissions
 provision: permissions
 	@echo -e "$(GREEN)[MAKE]$(NC) Aprovisionando VM..."
 	@sudo bash $(SCRIPTS_DIR)/provision_vm.sh
+	@$(MAKE) configure-env
+
+# Añade el venv al PATH del usuario operador (el que invocó sudo, no root).
+# Idempotente: no duplica la línea si ya existe en .bashrc.
+# También instala herramientas de desarrollo (pytest) si no están presentes.
+# NOTA: make no puede recargar el entorno de la shell padre (limitación Unix).
+#       El PATH estará disponible automáticamente en la próxima sesión SSH.
+#       Para la sesión actual ejecuta: source ~/.bashrc
+configure-env:
+	@echo -e "$(GREEN)[MAKE]$(NC) Configurando PATH del entorno virtual..."
+	@OPERATOR_USER="$${SUDO_USER:-$$(logname 2>/dev/null || echo azureuser)}"; \
+	OPERATOR_HOME=$$(eval echo "~$$OPERATOR_USER"); \
+	BASHRC="$$OPERATOR_HOME/.bashrc"; \
+	VENV_LINE='export PATH="$(VENV_BIN):$$PATH"'; \
+	if ! grep -qF '$(VENV_BIN)' "$$BASHRC" 2>/dev/null; then \
+		echo "$$VENV_LINE" >> "$$BASHRC"; \
+		echo -e "$(GREEN)[MAKE]$(NC) PATH del venv añadido a $$BASHRC para $$OPERATOR_USER"; \
+	else \
+		echo -e "$(GREEN)[SKIP]$(NC) PATH del venv ya presente en $$BASHRC"; \
+	fi; \
+	AIRFLOW_LINE='export AIRFLOW_HOME=/opt/airflow'; \
+	if ! grep -qF 'AIRFLOW_HOME' "$$BASHRC" 2>/dev/null; then \
+		echo "$$AIRFLOW_LINE" >> "$$BASHRC"; \
+		echo -e "$(GREEN)[MAKE]$(NC) AIRFLOW_HOME=/opt/airflow añadido a $$BASHRC"; \
+	else \
+		echo -e "$(GREEN)[SKIP]$(NC) AIRFLOW_HOME ya presente en $$BASHRC"; \
+	fi
+	@echo -e "$(GREEN)[MAKE]$(NC) Verificando herramientas de desarrollo..."
+	@if [ ! -f "$(VENV_BIN)/pytest" ]; then \
+		echo -e "$(GREEN)[MAKE]$(NC) Instalando pytest en el venv..."; \
+		sudo $(VENV_BIN)/pip install pytest --quiet; \
+		echo -e "$(GREEN)[MAKE]$(NC) pytest instalado"; \
+	else \
+		echo -e "$(GREEN)[SKIP]$(NC) pytest ya instalado"; \
+	fi
 
 vault-setup: permissions
 	@echo -e "$(GREEN)[MAKE]$(NC) Configurando Vault..."
 	@sudo bash $(VAULT_DIR)/setup_vault.sh
 
+# Ruta del almacenamiento Raft de Vault (BoltDB)
+VAULT_RAFT_PATH := /opt/vault/data
+
 # Desella Vault si está sealed. No-op si ya está abierto.
+# Recupera automáticamente el lock de BoltDB si Vault falló al arrancar
+# (síntoma: "failed to open bolt file: timeout" en journalctl).
 # Invocar manualmente tras cualquier reinicio de la VM o del proceso vault.
 vault-unseal: permissions
+	@echo -e "$(GREEN)[MAKE]$(NC) Verificando estado de Vault..."
+	@if sudo systemctl is-failed --quiet vault.service 2>/dev/null; then \
+		echo -e "$(YELLOW)[WARN]$(NC) vault.service en estado failed — comprobando causa..."; \
+		if sudo journalctl -u vault.service -n 20 --no-pager 2>/dev/null \
+				| grep -q "bolt file: timeout"; then \
+			echo -e "$(YELLOW)[WARN]$(NC) BoltDB lock detectado — liberando y reiniciando Vault..."; \
+			sudo pkill -9 vault 2>/dev/null || true; \
+			sudo rm -f $(VAULT_RAFT_PATH)/vault.db.lock 2>/dev/null || true; \
+			sudo systemctl reset-failed vault.service; \
+			sudo systemctl start vault.service; \
+			sleep 3; \
+			if ! sudo systemctl is-active --quiet vault.service; then \
+				echo -e "$(YELLOW)[ERROR]$(NC) Vault no arrancó tras limpiar el lock."; \
+				echo -e "         Revisa: sudo journalctl -u vault -n 30 --no-pager"; \
+				exit 1; \
+			fi; \
+			echo -e "$(GREEN)[MAKE]$(NC) Vault reiniciado correctamente tras limpiar BoltDB lock"; \
+		else \
+			echo -e "$(YELLOW)[WARN]$(NC) vault.service falló por causa desconocida — intentando restart..."; \
+			sudo systemctl reset-failed vault.service; \
+			sudo systemctl start vault.service; \
+			sleep 3; \
+		fi; \
+	fi
 	@echo -e "$(GREEN)[MAKE]$(NC) Verificando/desellando Vault..."
 	@sudo bash $(VAULT_DIR)/setup_vault.sh --unseal
 
@@ -111,11 +189,46 @@ vault-secrets: permissions
 		exit 1; \
 	fi
 	@ROOT_TOKEN=$$(sudo python3 -c "import json; print(json.load(open('/etc/mlops/vault-init/init.json'))['root_token'])") && \
-		sudo VAULT_TOKEN=$$ROOT_TOKEN bash $(VAULT_DIR)/write_secrets.sh
+		sudo VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=$$ROOT_TOKEN bash $(VAULT_DIR)/write_secrets.sh
+
+# Crea el usuario admin de Airflow leyendo las credenciales desde Vault.
+# Debe ejecutarse DESPUÉS de vault-secrets y ANTES (o después) de arrancar
+# airflow-webserver — airflow users create es idempotente.
+# No va en provision porque en ese momento Vault aún no existe.
+airflow-create-admin: permissions
+	@echo -e "$(GREEN)[MAKE]$(NC) Creando usuario admin de Airflow desde Vault..."
+	@ROOT_TOKEN=$$(sudo python3 -c "import json; print(json.load(open('/etc/mlops/vault-init/init.json'))['root_token'])"); \
+	CREDS=$$(sudo VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=$$ROOT_TOKEN \
+		vault kv get -format=json mlops/airflow \
+		| python3 -c \
+		"import sys,json; d=json.load(sys.stdin)['data']['data']; \
+		[print(k.upper()+'='+v) for k,v in d.items()]"); \
+	ADMIN_USER=$$(echo "$$CREDS" | grep ^ADMIN_USER= | cut -d= -f2); \
+	ADMIN_PASSWORD=$$(echo "$$CREDS" | grep ^ADMIN_PASSWORD= | cut -d= -f2); \
+	ADMIN_EMAIL=$$(echo "$$CREDS" | grep ^ADMIN_EMAIL= | cut -d= -f2); \
+	sudo -u mlops \
+		AIRFLOW_HOME=/opt/airflow \
+		PATH=$(VENV_BIN):$$PATH \
+		/opt/mlops_venv/bin/airflow users create \
+			--username "$$ADMIN_USER" \
+			--firstname Admin \
+			--lastname MLOps \
+			--role Admin \
+			--email "$$ADMIN_EMAIL" \
+			--password "$$ADMIN_PASSWORD" 2>/dev/null \
+		&& echo -e "$(GREEN)[MAKE]$(NC) Usuario admin creado: $$ADMIN_USER" \
+		|| echo -e "$(YELLOW)[SKIP]$(NC) El usuario admin ya existe (idempotente)"
 
 dvc-setup: permissions
 	@echo -e "$(GREEN)[MAKE]$(NC) Configurando DVC..."
 	@sudo bash $(SCRIPTS_DIR)/setup_dvc.sh
+	@OPERATOR_USER="$${SUDO_USER:-$$(logname 2>/dev/null || echo azureuser)}"; \
+	for dir in .git .dvc data models; do \
+		if [ -d "$$dir" ] && [ "$$(stat -c '%U' $$dir 2>/dev/null)" != "$$OPERATOR_USER" ]; then \
+			echo -e "$(GREEN)[MAKE]$(NC) Corrigiendo ownership de $$dir/ → $$OPERATOR_USER"; \
+			sudo chown -R "$$OPERATOR_USER":"$$OPERATOR_USER" "$$dir"/; \
+		fi; \
+	done
 
 # ──────────────────────────────────────────────
 # Operación de servicios
@@ -154,9 +267,33 @@ logs:
 # ──────────────────────────────────────────────
 # Desarrollo
 # ──────────────────────────────────────────────
+
+# Usa el pytest del venv directamente para garantizar que encuentra
+# todas las dependencias del proyecto sin necesidad de activar el venv.
 test:
 	@echo -e "$(GREEN)[MAKE]$(NC) Ejecutando tests..."
-	@python3 -m pytest tests/ -v
+	@$(VENV_BIN)/pytest tests/ -v
+
+# Versiona el dataset con DVC y hace push a MinIO.
+# Usa rutas absolutas del venv — no requiere activar el entorno ni source .bashrc.
+# Uso: make data-add CSV=data/raw/CustomerChurn.csv
+CSV ?= data/raw/CustomerChurn.csv
+data-add:
+	@if [ ! -f "$(CSV)" ]; then \
+		echo -e "$(YELLOW)[WARN]$(NC) No se encontró el archivo: $(CSV)"; \
+		echo -e "         Uso: make data-add CSV=data/raw/tu_archivo.csv"; \
+		exit 1; \
+	fi
+	@echo -e "$(GREEN)[MAKE]$(NC) Versionando $(CSV) con DVC..."
+	@$(VENV_BIN)/dvc add $(CSV)
+	@if git diff --cached --quiet; then \
+		echo -e "$(YELLOW)[SKIP]$(NC) Sin cambios para commitear en git"; \
+	else \
+		git commit -m "data: añadir $$(basename $(CSV)) v$$(date +%Y%m%d)"; \
+	fi
+	@echo -e "$(GREEN)[MAKE]$(NC) Haciendo push a MinIO..."
+	@$(VENV_BIN)/dvc push
+	@echo -e "$(GREEN)[MAKE]$(NC) Dataset versionado y disponible en MinIO"
 
 clean:
 	@echo -e "$(GREEN)[MAKE]$(NC) Limpiando artefactos temporales..."

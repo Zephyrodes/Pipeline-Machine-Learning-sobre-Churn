@@ -16,7 +16,11 @@
 set -euo pipefail
 
 SERVICE="${1:-}"
-VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
+# VAULT_ADDR se fija siempre a HTTP explícitamente para evitar que sudo u
+# otros entornos sin herencia de variables usen el default HTTPS de Vault.
+# El valor del entorno se ignora intencionadamente: la VM solo expone el
+# listener HTTP en loopback (tls_disable = true en vault.hcl).
+VAULT_ADDR="http://127.0.0.1:8200"
 VAULT_KV_PATH="mlops"
 SECRETS_BASE_DIR="/run/mlops-secrets"
 APPROLE_DIR="/etc/mlops/vault-init"
