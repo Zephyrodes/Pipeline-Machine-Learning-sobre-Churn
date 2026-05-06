@@ -73,11 +73,26 @@ export VAULT_TOKEN
 
 # ──────────────────────────────────────────────
 # Directorio de secretos en tmpfs (solo memoria)
-# El directorio padre /run/mlops-secrets existe gracias a tmpfiles.d
+# El directorio padre /run/mlops-secrets existe gracias a tmpfiles.d.
+# El subdirectorio del servicio puede no existir si systemd-tmpfiles solo
+# creó el directorio raíz (p.ej. tras un reinicio parcial o si la entrada
+# de tmpfiles.d solo cubre el directorio padre). Se crea aquí de forma
+# explícita con el owner correcto para que el proceso del servicio pueda
+# leer las credenciales.
 # ──────────────────────────────────────────────
 SERVICE_SECRETS_DIR="$SECRETS_BASE_DIR/$SERVICE"
+
+# El directorio padre debe existir (tmpfiles.d lo crea al arranque).
+# Si por alguna razón tampoco existe, crearlo para no enmascarar el error.
+if [[ ! -d "$SECRETS_BASE_DIR" ]]; then
+    mkdir -p "$SECRETS_BASE_DIR"
+    chmod 755 "$SECRETS_BASE_DIR"
+    chown mlops:mlops "$SECRETS_BASE_DIR"
+fi
+
 mkdir -p "$SERVICE_SECRETS_DIR"
 chmod 700 "$SERVICE_SECRETS_DIR"
+chown mlops:mlops "$SERVICE_SECRETS_DIR"
 
 # ──────────────────────────────────────────────
 # Helpers

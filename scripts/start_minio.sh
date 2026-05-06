@@ -62,13 +62,46 @@ _fetch_credentials() {
 }
 
 # ──────────────────────────────────────────────
-# 2. Arrancar MinIO si no está corriendo
+# 2. Preparar directorio tmpfs para las credenciales de minio
+#
+# fetch_secrets.sh (ExecStartPre= de minio.service) necesita escribir en
+# /run/mlops-secrets/minio/ pero ese subdirectorio puede no existir:
+#   - systemd-tmpfiles solo recreó el directorio padre al arranque.
+#   - ExecStartPre= corre como usuario mlops, sin permisos para crear
+#     subdirectorios si mlops no es dueño de /run/mlops-secrets/.
+#
+# Se crea aquí corriendo como root (start_minio.sh se invoca con sudo),
+# antes de llamar a systemctl start — así fetch_secrets.sh solo necesita
+# escribir el archivo credentials, no crear el directorio.
+# ──────────────────────────────────────────────
+_prepare_secrets_dir() {
+    local secrets_base="/run/mlops-secrets"
+    local minio_secrets_dir="$secrets_base/minio"
+
+    if [[ ! -d "$secrets_base" ]]; then
+        mkdir -p "$secrets_base"
+        chmod 755 "$secrets_base"
+        chown mlops:mlops "$secrets_base"
+        log_info "Directorio tmpfs $secrets_base creado"
+    fi
+
+    if [[ ! -d "$minio_secrets_dir" ]]; then
+        mkdir -p "$minio_secrets_dir"
+        chmod 700 "$minio_secrets_dir"
+        chown mlops:mlops "$minio_secrets_dir"
+        log_info "Directorio de secretos $minio_secrets_dir creado"
+    fi
+}
+
+# ──────────────────────────────────────────────
+# 3. Arrancar MinIO si no está corriendo
 # ──────────────────────────────────────────────
 _ensure_minio_running() {
     if systemctl is-active --quiet minio; then
         log_info "MinIO ya está corriendo"
         return
     fi
+    _prepare_secrets_dir
     log_info "Arrancando MinIO..."
     systemctl start minio
     _wait_for_minio
@@ -91,7 +124,7 @@ _wait_for_minio() {
 }
 
 # ──────────────────────────────────────────────
-# 3. Verificar credenciales y resetear si no coinciden
+# 4. Verificar credenciales y resetear si no coinciden
 # ──────────────────────────────────────────────
 _verify_or_reset_credentials() {
     # Prueba silenciosa: mc alias set falla si las credenciales son incorrectas
@@ -121,6 +154,7 @@ _verify_or_reset_credentials() {
 
     # Reiniciar con las credenciales correctas de Vault
     log_info "Reiniciando MinIO con credenciales de Vault..."
+    _prepare_secrets_dir
     systemctl start minio
     _wait_for_minio
 

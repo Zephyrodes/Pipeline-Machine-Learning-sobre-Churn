@@ -24,7 +24,7 @@ YELLOW := \033[1;33m
 NC     := \033[0m
 
 .PHONY: help install provision configure-env vault-setup vault-unseal vault-secrets \
-        airflow-create-admin dvc-setup start-minio start stop status restart logs test clean permissions data-add
+        airflow-create-admin airflow-setup-dags dvc-setup start-minio start stop status restart logs test clean permissions data-add
 
 # ──────────────────────────────────────────────
 # Ayuda
@@ -44,6 +44,7 @@ help:
 	@echo "    make vault-unseal     → desellar Vault si está sealed (safe re-run)"
 	@echo "    make vault-secrets         → cargar secretos del .env en Vault"
 	@echo "    make airflow-create-admin  → crear usuario admin de Airflow (post-Vault)"
+	@echo "    make airflow-setup-dags    → desactivar ejemplos y registrar el DAG del proyecto"
 	@echo "    make dvc-setup             → inicializar DVC y crear buckets en MinIO"
 	@echo ""
 	@echo "  Operación:"
@@ -73,15 +74,19 @@ permissions:
 # Despliegue completo en orden
 #
 # Orden crítico:
-#   1. provision      → instala binarios, registra units systemd
-#                       y configura el PATH del venv en .bashrc
-#   2. vault-setup    → instala Vault, lo inicializa y configura AppRoles
-#   3. vault-secrets  → escribe los secretos del .env en Vault
-#   4. vault-unseal   → garantiza que Vault está unsealed justo antes
-#                       de que los servicios intenten leer secretos
-#   5. start-minio    → arranca MinIO; dvc-setup necesita el API en :9000
-#   6. dvc-setup      → crea buckets e inicializa DVC
-#   7. start          → arranca el resto de servicios
+#   1. provision          → instala binarios, registra units systemd
+#                           y configura el PATH del venv en .bashrc
+#   2. vault-setup        → instala Vault, lo inicializa y configura AppRoles
+#   3. vault-secrets      → escribe los secretos del .env en Vault
+#   4. vault-unseal       → garantiza que Vault está unsealed justo antes
+#                           de que los servicios intenten leer secretos
+#   5. start-minio        → arranca MinIO; dvc-setup necesita el API en :9000
+#   6. airflow-create-admin → crea el usuario admin de Airflow
+#   7. dvc-setup          → crea buckets e inicializa DVC
+#   8. start              → arranca el resto de servicios (Airflow ya corriendo)
+#   9. airflow-setup-dags → desactiva los DAGs de ejemplo y publica el DAG del
+#                           proyecto; el restart al final del script es efectivo
+#                           porque los servicios ya están activos
 # ──────────────────────────────────────────────
 install: permissions
 	@echo -e "$(GREEN)[MAKE]$(NC) Iniciando despliegue completo..."
@@ -93,6 +98,7 @@ install: permissions
 	@$(MAKE) airflow-create-admin
 	@$(MAKE) dvc-setup
 	@$(MAKE) start
+	@$(MAKE) airflow-setup-dags
 	@echo ""
 	@echo -e "$(GREEN)[MAKE]$(NC) Despliegue completo. Ejecuta 'make status' para verificar."
 	@echo ""
@@ -219,6 +225,14 @@ airflow-create-admin: permissions
 		&& echo -e "$(GREEN)[MAKE]$(NC) Usuario admin creado: $$ADMIN_USER" \
 		|| echo -e "$(YELLOW)[SKIP]$(NC) El usuario admin ya existe (idempotente)"
 
+# Desactiva los DAGs de ejemplo de Airflow y publica el DAG del proyecto.
+# Crea los symlinks necesarios en /opt/airflow/dags/ y parchea airflow.cfg.
+# Idempotente: seguro de re-ejecutar si se añaden nuevos DAGs al proyecto.
+airflow-setup-dags: permissions
+	@echo -e "$(GREEN)[MAKE]$(NC) Configurando DAGs de Airflow..."
+	@sudo bash $(SCRIPTS_DIR)/setup_airflow_dags.sh
+	@echo -e "$(GREEN)[MAKE]$(NC) DAGs configurados — el DAG 'churn_prediction_pipeline' ya está disponible"
+
 dvc-setup: permissions
 	@echo -e "$(GREEN)[MAKE]$(NC) Configurando DVC..."
 	@sudo bash $(SCRIPTS_DIR)/setup_dvc.sh
@@ -239,8 +253,14 @@ SERVICES := minio mlflow-server airflow-webserver airflow-scheduler mlops-api
 # con las que Vault tiene escritas. Si MinIO arrancó previamente con
 # credenciales distintas (p.ej. minioadmin:minioadmin por defecto),
 # el script limpia el estado persistido y lo reinicia limpio.
+# Si el servicio lleva varios ciclos fallidos (StartLimitBurst), se hace
+# reset-failed antes para que systemd permita el siguiente intento.
 start-minio:
 	@echo -e "$(GREEN)[MAKE]$(NC) Arrancando MinIO..."
+	@if sudo systemctl is-failed --quiet minio.service 2>/dev/null; then \
+		echo -e "$(YELLOW)[WARN]$(NC) minio.service en estado failed — reseteando contadores..."; \
+		sudo systemctl reset-failed minio.service; \
+	fi
 	@sudo bash $(SCRIPTS_DIR)/start_minio.sh
 	@echo -e "$(GREEN)[MAKE]$(NC) MinIO listo"
 

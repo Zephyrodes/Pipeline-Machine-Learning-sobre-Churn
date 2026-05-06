@@ -480,6 +480,28 @@ configure_approle() {
         chown root:"$MLOPS_GROUP" "$role_dir/role_id"   && chmod 640 "$role_dir/role_id"
         chown root:"$MLOPS_GROUP" "$role_dir/secret_id" && chmod 640 "$role_dir/secret_id"
 
+        # Garantizar que el subdirectorio tmpfs de este servicio está declarado
+        # en tmpfiles.d — si provision_vm.sh solo creó la entrada para el
+        # directorio padre, el subdirectorio <servicio>/ no se recrea en cada
+        # arranque y fetch_secrets.sh falla al intentar escribir las credenciales.
+        local tmpfiles_conf="/etc/tmpfiles.d/mlops-secrets.conf"
+        local tmpfiles_line="d /run/mlops-secrets/$service 0700 mlops mlops -"
+        if [[ ! -f "$tmpfiles_conf" ]] || ! grep -qF "/run/mlops-secrets/$service" "$tmpfiles_conf" 2>/dev/null; then
+            echo "$tmpfiles_line" >> "$tmpfiles_conf"
+            log_info "tmpfiles.d: entrada para $service añadida en $tmpfiles_conf"
+        else
+            log_skip "tmpfiles.d: entrada para $service ya presente"
+        fi
+
+        # Crear el directorio en el tmpfs actual (sin esperar al próximo arranque)
+        local runtime_dir="/run/mlops-secrets/$service"
+        if [[ ! -d "$runtime_dir" ]]; then
+            mkdir -p "$runtime_dir"
+            chmod 700 "$runtime_dir"
+            chown mlops:"$MLOPS_GROUP" "$runtime_dir"
+            log_info "Directorio runtime $runtime_dir creado"
+        fi
+
         log_info "AppRole '$role_name' → $role_dir/"
     done
 }

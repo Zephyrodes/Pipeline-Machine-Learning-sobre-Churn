@@ -443,7 +443,9 @@ fix_dvc_ownership() {
         fi
     done
 
-    $changed && log_info "Ownership corregido — puedes ejecutar 'dvc add' y 'make data-add' sin sudo"
+    if $changed; then
+        log_info "Ownership corregido — puedes ejecutar 'dvc add' y 'make data-add' sin sudo"
+    fi
 }
 
 main() {

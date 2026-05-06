@@ -193,14 +193,29 @@ setup_python_virtualenv() {
         log_skip "Entorno virtual ya existe en $VENV_PATH"
         # shellcheck source=/dev/null
         source "$VENV_PATH/bin/activate"
-        return
+    else
+        python3.12 -m venv "$VENV_PATH"
+        # shellcheck source=/dev/null
+        source "$VENV_PATH/bin/activate"
+        pip install --upgrade pip wheel
+        log_info "Entorno virtual creado en $VENV_PATH"
     fi
 
-    python3.12 -m venv "$VENV_PATH"
-    # shellcheck source=/dev/null
-    source "$VENV_PATH/bin/activate"
-    pip install --upgrade pip setuptools wheel
-    log_info "Entorno virtual creado en $VENV_PATH"
+    # setuptools debe estar presente siempre: en Python 3.12 + pip moderno
+    # ya no se incluye en el venv por defecto, pero mlflow y otros paquetes
+    # importan pkg_resources en tiempo de modulo (no en instalacion).
+    # Si falta, Airflow no puede parsear el DAG aunque mlflow este instalado.
+    # Idempotente: solo instala si setuptools no esta presente.
+    local st_version
+    st_version=$("$VENV_PATH/bin/pip" show setuptools 2>/dev/null \
+                 | awk '/^Version:/{print $2}')
+    if [[ -z "$st_version" ]]; then
+        log_info "setuptools no encontrado — instalando..."
+        pip install --quiet "setuptools>=70"
+        log_info "setuptools instalado"
+    else
+        log_skip "setuptools $st_version ya presente"
+    fi
 }
 
 # ──────────────────────────────────────────────
@@ -367,6 +382,17 @@ install_airflow() {
     else
         local CONSTRAINT_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
         pip install --quiet "apache-airflow==${AIRFLOW_VERSION}" --constraint "$CONSTRAINT_URL"
+    fi
+
+    # setuptools debe estar instalado ANTES de airflow db migrate.
+    # Durante la migración, Airflow escanea el dags_folder y ejecuta
+    # dagbag.py, que importa los módulos del DAG. Si alguno importa mlflow
+    # y setuptools no está, la importación falla con ModuleNotFoundError:
+    # pkg_resources — el error se registra en el log pero NO aborta la
+    # migración, dejando el problema silencioso hasta que se arranca el scheduler.
+    if ! pip show setuptools &>/dev/null; then
+        log_info "Instalando setuptools antes de db migrate..."
+        pip install --quiet "setuptools>=70"
     fi
 
     # db migrate es idempotente por diseño (Alembic)

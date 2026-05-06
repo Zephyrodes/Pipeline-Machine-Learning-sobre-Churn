@@ -3,6 +3,12 @@
 # Instalar con: pip install -r requirements.txt
 # =============================================================================
 
+# ── Infraestructura base ──────────────────────────────────────────────────────
+# setuptools provee pkg_resources, requerido en tiempo de módulo por mlflow
+# y otras librerías. En Python 3.12 + pip moderno ya no se incluye en el
+# venv automáticamente — debe declararse explícitamente.
+setuptools>=70
+
 # ── Orquestación ──────────────────────────────────────────────────────────────
 apache-airflow==2.9.3
 
