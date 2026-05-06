@@ -244,6 +244,16 @@ install_minio() {
 
     chown -R "$MLOPS_USER:$MLOPS_GROUP" "$MINIO_HOME"
 
+    # El unit usa EnvironmentFile= en lugar de `source` dentro de ExecStart.
+    #
+    # Problema resuelto: systemd expande ${VAR} en ExecStart= desde su propio
+    # entorno ANTES de invocar el shell. Como ROOT_USER/ROOT_PASSWORD no estaban
+    # en el entorno del servicio, systemd los expandia a vacio y MinIO arrancaba
+    # con las credenciales por defecto minioadmin:minioadmin.
+    #
+    # Solucion: EnvironmentFile= carga el archivo de credenciales que escribio
+    # fetch_secrets.sh directamente en el entorno del proceso. MinIO recibe
+    # MINIO_ROOT_USER y MINIO_ROOT_PASSWORD como variables de entorno reales.
     local unit_content
     unit_content="$(cat << EOF
 [Unit]
@@ -256,13 +266,10 @@ Requires=vault.service
 Environment=VAULT_ADDR=http://127.0.0.1:8200
 Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/minio/credentials
 ExecStartPre=/usr/local/bin/fetch_secrets.sh minio
-ExecStart=/bin/bash -c '\
-    source \${SERVICE_SECRETS_FILE} && \
-    MINIO_ROOT_USER=\${ROOT_USER} \
-    MINIO_ROOT_PASSWORD=\${ROOT_PASSWORD} \
-    /usr/local/bin/minio server \
-        --console-address :${PORT_MINIO_CONSOLE} \
-        ${MINIO_HOME}/data'
+EnvironmentFile=/run/mlops-secrets/minio/credentials
+ExecStart=/usr/local/bin/minio server --console-address :${PORT_MINIO_CONSOLE} ${MINIO_HOME}/data
+Environment=MINIO_ROOT_USER=\${ROOT_USER}
+Environment=MINIO_ROOT_PASSWORD=\${ROOT_PASSWORD}
 User=${MLOPS_USER}
 Group=${MLOPS_GROUP}
 Restart=always
