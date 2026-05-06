@@ -120,7 +120,21 @@ write_env_file_from_stdin() {
 # ──────────────────────────────────────────────
 case "$SERVICE" in
     minio)
-        write_env_file "${VAULT_KV_PATH}/minio"
+        # Mapeo explícito de keys de Vault a las variables de entorno que
+        # MinIO reconoce. `write_env_file` hace k.upper() genérico, produciendo
+        # ROOT_USER/ROOT_PASSWORD — nombres que MinIO ignora. MinIO solo lee
+        # MINIO_ROOT_USER y MINIO_ROOT_PASSWORD del entorno del proceso.
+        {
+            vault kv get -format=json "${VAULT_KV_PATH}/minio" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)['data']['data']
+print(f'MINIO_ROOT_USER={d["root_user"]}')
+print(f'MINIO_ROOT_PASSWORD={d["root_password"]}')
+print(f'ENDPOINT={d["endpoint"]}')
+print(f'DVC_BUCKET={d["dvc_bucket"]}')
+print(f'MLFLOW_BUCKET={d["mlflow_bucket"]}')
+"
+        } | write_env_file_from_stdin
         ;;
 
     mlflow)

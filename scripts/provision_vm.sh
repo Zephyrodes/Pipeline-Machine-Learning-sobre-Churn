@@ -268,8 +268,6 @@ Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/minio/credentials
 ExecStartPre=/usr/local/bin/fetch_secrets.sh minio
 EnvironmentFile=/run/mlops-secrets/minio/credentials
 ExecStart=/usr/local/bin/minio server --console-address :${PORT_MINIO_CONSOLE} ${MINIO_HOME}/data
-Environment=MINIO_ROOT_USER=\${ROOT_USER}
-Environment=MINIO_ROOT_PASSWORD=\${ROOT_PASSWORD}
 User=${MLOPS_USER}
 Group=${MLOPS_GROUP}
 Restart=always
