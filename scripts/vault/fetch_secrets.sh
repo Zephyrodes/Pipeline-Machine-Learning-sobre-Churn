@@ -120,20 +120,24 @@ write_env_file_from_stdin() {
 # ──────────────────────────────────────────────
 case "$SERVICE" in
     minio)
-        # Mapeo explícito de keys de Vault a las variables de entorno que
-        # MinIO reconoce. `write_env_file` hace k.upper() genérico, produciendo
-        # ROOT_USER/ROOT_PASSWORD — nombres que MinIO ignora. MinIO solo lee
-        # MINIO_ROOT_USER y MINIO_ROOT_PASSWORD del entorno del proceso.
+        # Mapeo explícito: las keys de Vault (root_user, root_password) se
+        # exportan como MINIO_ROOT_USER/MINIO_ROOT_PASSWORD — los nombres
+        # que MinIO reconoce. Se usa un script Python en archivo temporal
+        # para evitar el quoting de comillas dobles dentro de bash -c "...".
         {
-            vault kv get -format=json "${VAULT_KV_PATH}/minio" | python3 -c "
+            local _py
+            _py=$(mktemp /tmp/fetch_minio_XXXXXX.py)
+            cat > "$_py" << 'MINIO_PY'
 import sys, json
 d = json.load(sys.stdin)['data']['data']
-print(f'MINIO_ROOT_USER={d["root_user"]}')
-print(f'MINIO_ROOT_PASSWORD={d["root_password"]}')
-print(f'ENDPOINT={d["endpoint"]}')
-print(f'DVC_BUCKET={d["dvc_bucket"]}')
-print(f'MLFLOW_BUCKET={d["mlflow_bucket"]}')
-"
+print('MINIO_ROOT_USER='     + d['root_user'])
+print('MINIO_ROOT_PASSWORD=' + d['root_password'])
+print('ENDPOINT='            + d['endpoint'])
+print('DVC_BUCKET='          + d['dvc_bucket'])
+print('MLFLOW_BUCKET='       + d['mlflow_bucket'])
+MINIO_PY
+            vault kv get -format=json "${VAULT_KV_PATH}/minio" | python3 "$_py"
+            rm -f "$_py"
         } | write_env_file_from_stdin
         ;;
 
