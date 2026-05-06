@@ -187,12 +187,23 @@ install_mc_client() {
 }
 
 # ──────────────────────────────────────────────
-# 3. Esperar a que MinIO esté disponible
+# 3. Preparar MinIO: limpiar estado persistido si las credenciales
+#    no coinciden, luego esperar a que el servicio esté disponible.
 #
-# dvc-setup corre antes de `make start` en el flujo de install,
-# así que MinIO puede no estar arrancado todavía. Esperamos hasta
-# 60 s antes de fallar con un mensaje accionable.
+# Por qué: MinIO persiste las credenciales de root en
+# $MINIO_HOME/data/.minio.sys/ la primera vez que arranca.
+# Si arrancó previamente con minioadmin:minioadmin (credenciales por
+# defecto, cuando Vault aún no tenía los secretos escritos), esas
+# quedan grabadas en disco y MinIO las ignora aunque el servicio
+# reciba otras por variable de entorno en arranques posteriores.
+#
+# Solución: detectar el mismatch probando el alias mc con las
+# credenciales de Vault. Si falla, parar MinIO, borrar el estado
+# persistido y reiniciarlo para que arranque limpio con las
+# credenciales correctas.
 # ──────────────────────────────────────────────
+MINIO_HOME="${MINIO_HOME:-/opt/minio}"
+
 _wait_for_minio() {
     local endpoint="$1"
     local retries=30   # 30 × 2 s = 60 s máximo
@@ -203,16 +214,46 @@ _wait_for_minio() {
         (( retries-- )) || true
     done
 
-    if ! curl -sf --max-time 2 "${endpoint}/minio/health/live" -o /dev/null 2>/dev/null; then
+    if ! curl -sf --max-time 2 "${endpoint}/minio/health/live"             -o /dev/null 2>/dev/null; then
         log_error "MinIO no responde en $endpoint después de 60 s"
-        log_error "  → Arráncalo primero:"
-        log_error "      sudo systemctl start minio"
-        log_error "  → O revisa los logs:"
-        log_error "      sudo journalctl -u minio -n 50 --no-pager"
+        log_error "  → Revisa los logs: sudo journalctl -u minio -n 50 --no-pager"
         exit 1
     fi
 
     log_info "MinIO disponible en $endpoint"
+}
+
+_reset_minio_if_credentials_mismatch() {
+    # Prueba silenciosa con las credenciales de Vault.
+    # mc alias set falla con exit != 0 si las credenciales son incorrectas.
+    if mc alias set probe "$MINIO_ENDPOINT"             "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"             --quiet 2>/dev/null; then
+        mc alias rm probe &>/dev/null || true
+        log_skip "Credenciales de MinIO correctas — sin reset necesario"
+        return
+    fi
+    mc alias rm probe &>/dev/null || true
+
+    log_warn "Credenciales de MinIO no coinciden con Vault — reseteando estado persistido"
+    log_warn "  (MinIO arrancó previamente con credenciales distintas)"
+
+    # Detener MinIO antes de tocar su estado
+    if systemctl is-active --quiet minio 2>/dev/null; then
+        systemctl stop minio
+        log_info "MinIO detenido para reset"
+    fi
+
+    # Borrar solo el estado de configuración (credenciales, políticas).
+    # Los datos de usuario (buckets y objetos) se preservan.
+    local config_dir="$MINIO_HOME/data/.minio.sys"
+    if [[ -d "$config_dir" ]]; then
+        rm -rf "$config_dir"
+        log_info "Estado persistido de MinIO eliminado ($config_dir)"
+    fi
+
+    # Reiniciar y esperar a que levante con las credenciales correctas
+    systemctl start minio
+    _wait_for_minio "$MINIO_ENDPOINT"
+    log_info "MinIO reiniciado con credenciales de Vault"
 }
 
 # ──────────────────────────────────────────────
@@ -220,7 +261,8 @@ _wait_for_minio() {
 # ──────────────────────────────────────────────
 create_minio_buckets() {
     _wait_for_minio "$MINIO_ENDPOINT"
-
+    # Las credenciales ya fueron verificadas y el estado de MinIO
+    # sincronizado con Vault por start_minio.sh (make start-minio).
     log_info "Configurando alias mc → $MINIO_ENDPOINT"
     mc alias set local "$MINIO_ENDPOINT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" --quiet
 

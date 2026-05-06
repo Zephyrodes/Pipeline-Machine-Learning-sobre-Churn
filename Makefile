@@ -122,12 +122,14 @@ dvc-setup: permissions
 # ──────────────────────────────────────────────
 SERVICES := minio mlflow-server airflow-webserver airflow-scheduler mlops-api
 
-# Arranca solo MinIO. Usado en install para que dvc-setup pueda
-# crear los buckets antes de que se lancen el resto de servicios.
+# Arranca MinIO asegurando que las credenciales en disco coincidan
+# con las que Vault tiene escritas. Si MinIO arrancó previamente con
+# credenciales distintas (p.ej. minioadmin:minioadmin por defecto),
+# el script limpia el estado persistido y lo reinicia limpio.
 start-minio:
 	@echo -e "$(GREEN)[MAKE]$(NC) Arrancando MinIO..."
-	@sudo systemctl start minio
-	@echo -e "$(GREEN)[MAKE]$(NC) MinIO arrancado"
+	@sudo bash $(SCRIPTS_DIR)/start_minio.sh
+	@echo -e "$(GREEN)[MAKE]$(NC) MinIO listo"
 
 start:
 	@echo -e "$(GREEN)[MAKE]$(NC) Arrancando servicios..."
