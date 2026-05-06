@@ -131,7 +131,7 @@ start-minio:
 	@sudo bash $(SCRIPTS_DIR)/start_minio.sh
 	@echo -e "$(GREEN)[MAKE]$(NC) MinIO listo"
 
-start:
+start: vault-unseal
 	@echo -e "$(GREEN)[MAKE]$(NC) Arrancando servicios..."
 	@sudo systemctl start $(SERVICES)
 	@echo -e "$(GREEN)[MAKE]$(NC) Servicios arrancados. Ejecuta 'make status' para verificar."
@@ -140,7 +140,7 @@ stop:
 	@echo -e "$(GREEN)[MAKE]$(NC) Deteniendo servicios..."
 	@sudo systemctl stop $(SERVICES)
 
-restart:
+restart: vault-unseal
 	@echo -e "$(GREEN)[MAKE]$(NC) Reiniciando servicios..."
 	@sudo systemctl restart $(SERVICES)
 
