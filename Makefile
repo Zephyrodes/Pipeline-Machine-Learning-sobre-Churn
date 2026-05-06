@@ -11,13 +11,17 @@ SHELL := /bin/bash
 SCRIPTS_DIR := scripts
 VAULT_DIR   := scripts/vault
 
+# Silencia el warning de gosnowflake/dbus que aparece en cada invocación
+# de `vault` cuando no hay sesión de escritorio activa (servidor headless).
+export DBUS_SESSION_BUS_ADDRESS ?= /dev/null
+
 # Colores
 GREEN  := \033[0;32m
 YELLOW := \033[1;33m
 NC     := \033[0m
 
-.PHONY: help install provision vault-setup vault-secrets dvc-setup \
-        start stop status restart logs test clean permissions
+.PHONY: help install provision vault-setup vault-unseal vault-secrets dvc-setup \
+        start-minio start stop status restart logs test clean permissions
 
 # ──────────────────────────────────────────────
 # Ayuda
@@ -33,6 +37,7 @@ help:
 	@echo "    make permissions      → dar permisos de ejecución a todos los scripts"
 	@echo "    make provision        → instalar dependencias y registrar servicios"
 	@echo "    make vault-setup      → instalar y configurar HashiCorp Vault"
+	@echo "    make vault-unseal     → desellar Vault si está sealed (safe re-run)"
 	@echo "    make vault-secrets    → cargar secretos del .env en Vault"
 	@echo "    make dvc-setup        → inicializar DVC y crear buckets en MinIO"
 	@echo ""
@@ -58,12 +63,24 @@ permissions:
 
 # ──────────────────────────────────────────────
 # Despliegue completo en orden
+#
+# Orden crítico:
+#   1. provision      → instala binarios y registra units systemd
+#   2. vault-setup    → instala Vault, lo inicializa y configura AppRoles
+#   3. vault-secrets  → escribe los secretos del .env en Vault
+#   4. vault-unseal   → garantiza que Vault está unsealed justo antes
+#                       de que los servicios intenten leer secretos
+#   5. start-minio    → arranca MinIO; dvc-setup necesita el API en :9000
+#   6. dvc-setup      → crea buckets e inicializa DVC
+#   7. start          → arranca el resto de servicios
 # ──────────────────────────────────────────────
 install: permissions
 	@echo -e "$(GREEN)[MAKE]$(NC) Iniciando despliegue completo..."
 	@$(MAKE) provision
 	@$(MAKE) vault-setup
 	@$(MAKE) vault-secrets
+	@$(MAKE) vault-unseal
+	@$(MAKE) start-minio
 	@$(MAKE) dvc-setup
 	@$(MAKE) start
 	@echo ""
@@ -80,6 +97,12 @@ vault-setup: permissions
 	@echo -e "$(GREEN)[MAKE]$(NC) Configurando Vault..."
 	@sudo bash $(VAULT_DIR)/setup_vault.sh
 
+# Desella Vault si está sealed. No-op si ya está abierto.
+# Invocar manualmente tras cualquier reinicio de la VM o del proceso vault.
+vault-unseal: permissions
+	@echo -e "$(GREEN)[MAKE]$(NC) Verificando/desellando Vault..."
+	@sudo bash $(VAULT_DIR)/setup_vault.sh --unseal
+
 vault-secrets: permissions
 	@echo -e "$(GREEN)[MAKE]$(NC) Cargando secretos en Vault..."
 	@if [ ! -f .env ]; then \
@@ -92,12 +115,19 @@ vault-secrets: permissions
 
 dvc-setup: permissions
 	@echo -e "$(GREEN)[MAKE]$(NC) Configurando DVC..."
-	@bash $(SCRIPTS_DIR)/setup_dvc.sh
+	@sudo bash $(SCRIPTS_DIR)/setup_dvc.sh
 
 # ──────────────────────────────────────────────
 # Operación de servicios
 # ──────────────────────────────────────────────
 SERVICES := minio mlflow-server airflow-webserver airflow-scheduler mlops-api
+
+# Arranca solo MinIO. Usado en install para que dvc-setup pueda
+# crear los buckets antes de que se lancen el resto de servicios.
+start-minio:
+	@echo -e "$(GREEN)[MAKE]$(NC) Arrancando MinIO..."
+	@sudo systemctl start minio
+	@echo -e "$(GREEN)[MAKE]$(NC) MinIO arrancado"
 
 start:
 	@echo -e "$(GREEN)[MAKE]$(NC) Arrancando servicios..."

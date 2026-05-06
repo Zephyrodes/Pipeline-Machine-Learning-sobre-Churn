@@ -556,6 +556,18 @@ print_next_steps() {
 
 main() {
     check_root
+
+    # Subcomando: setup_vault.sh --unseal
+    # Usado por `make vault-unseal` para desellar Vault sin re-ejecutar
+    # todo el flujo de configuración. Seguro de invocar en cualquier momento.
+    if [[ "${1:-}" == "--unseal" ]]; then
+        log_section "Unseal manual de Vault"
+        _wait_for_vault
+        _unseal_if_needed
+        log_info "Vault listo"
+        return
+    fi
+
     install_vault
     configure_and_start_vault
     initialize_vault    # inicializa si es primera vez; unseal si ya está inicializado
