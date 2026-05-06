@@ -125,7 +125,6 @@ case "$SERVICE" in
         # que MinIO reconoce. Se usa un script Python en archivo temporal
         # para evitar el quoting de comillas dobles dentro de bash -c "...".
         {
-            local _py
             _py=$(mktemp /tmp/fetch_minio_XXXXXX.py)
             cat > "$_py" << 'MINIO_PY'
 import sys, json
