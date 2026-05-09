@@ -10,7 +10,9 @@
 #   4. Crea un symlink de src/ del proyecto → /opt/airflow/dags/src
 #      (el DAG importa desde esa ruta fija)
 #   5. Elimina los archivos de ejemplo que ya estuviesen en disco
-#   6. Reinicia airflow-webserver y airflow-scheduler para aplicar cambios
+#   6. Verifica / crea el directorio de datos raw
+#   7. Instala dependencias Python (setuptools bootstrap + requirements.txt)
+#   8. Reinicia airflow-webserver y airflow-scheduler para aplicar cambios
 #
 # Uso:
 #   sudo bash scripts/setup_airflow_dags.sh
@@ -313,7 +315,162 @@ link_src_dir() {
 }
 
 # ──────────────────────────────────────────────
-# 6. Reiniciar servicios de Airflow para aplicar cambios
+# 6. Crear todos los directorios de datos del pipeline y verificar
+#    que el dataset esté disponible para el DAG.
+#
+# Directorios necesarios (escritura en runtime por el usuario mlops):
+#   /opt/mlops/data/raw/       → ingesta_datos escribe telco_churn_latest.csv
+#   /opt/mlops/data/processed/ → preprocesamiento escribe train.parquet / test.parquet
+#   /opt/mlops/models/         → entrenamiento escribe feature_importance.csv
+#
+# Problema resuelto: provision_vm.sh crea /opt/mlops/ como root y solo
+# da chown al subdirectorio data/raw/ al que necesita acceder en ese momento.
+# Los directorios data/processed/ y models/ no existen, así que cuando el
+# DAG corre como mlops e intenta mkdir() sobre /opt/mlops/data/processed,
+# falla con PermissionError porque /opt/mlops/data/ es propiedad de root
+# sin write permission para otros.
+#
+# Solución:
+#   1. Crear la jerarquía completa de directorios con mkdir -p.
+#   2. Asignar chown mlops:mlops a /opt/mlops/ y toda su descendencia,
+#      de modo que el proceso mlops pueda crear subdirectorios libremente
+#      en runtime sin necesidad de root.
+#   3. Dar o+x a los directorios de traversal (/opt/mlops, /opt/mlops/data)
+#      para que otros procesos del sistema puedan hacer stat() sobre ellos.
+# ──────────────────────────────────────────────
+ensure_data_dir() {
+    local canonical_path="/opt/mlops/data/raw/telco_churn.csv"
+    local mlops_root="/opt/mlops"
+
+    # ── Directorios requeridos por cada tarea del DAG ─────────────────────
+    # Todos deben existir antes del primer run; el DAG no tiene permisos
+    # para crearlos si el directorio padre pertenece a root.
+    local -a required_dirs=(
+        "/opt/mlops/data/raw"           # ingesta_datos
+        "/opt/mlops/data/processed"     # preprocesamiento
+        "/opt/mlops/data/processed/preprocessing_artifacts"  # preprocess artefactos
+        "/opt/mlops/models"             # entrenamiento (feature_importance.csv)
+    )
+
+    log_info "Creando estructura de directorios del pipeline MLOps..."
+
+    for dir in "${required_dirs[@]}"; do
+        if [[ ! -d "$dir" ]]; then
+            mkdir -p "$dir"
+            log_info "  Creado: $dir"
+        else
+            log_skip "  Ya existe: $dir"
+        fi
+    done
+
+    # ── Ownership: todo el árbol /opt/mlops/ pertenece a mlops ───────────
+    # Esto permite que el proceso mlops cree archivos y subdirectorios
+    # libremente en runtime (train.parquet, preprocessing_artifacts/, etc.)
+    # sin necesitar escalada de privilegios.
+    chown -R mlops:mlops "$mlops_root"
+    log_info "Ownership mlops:mlops aplicado recursivamente a $mlops_root"
+
+    # ── Traversal: o+x en los directorios de la jerarquía ────────────────
+    # Necesario para que otros usuarios del sistema (azureuser, root en
+    # comandos de diagnóstico) puedan hacer stat() sobre los subdirectorios
+    # sin necesitar ser mlops ni pertenecer al grupo mlops.
+    chmod o+x "$mlops_root" "$mlops_root/data"
+    log_info "Permisos de traversal (o+x) aplicados a $mlops_root y $mlops_root/data"
+
+    # ── Verificar que el dataset fuente está disponible ───────────────────
+    if [[ -f "$canonical_path" ]]; then
+        log_info "Dataset disponible: $canonical_path"
+    else
+        local data_raw_dir
+        data_raw_dir="$(dirname "$canonical_path")"
+
+        # Buscar el CSV con nombres alternativos en la misma carpeta
+        local alt_csv="$data_raw_dir/CustomerChurn.csv"
+        if [[ -f "$alt_csv" ]]; then
+            cp "$alt_csv" "$canonical_path"
+            chown mlops:mlops "$canonical_path"
+            log_info "Dataset copiado desde nombre alternativo: $alt_csv → $canonical_path"
+        else
+            log_warn "═══════════════════════════════════════════════════════════"
+            log_warn " AVISO: El dataset NO está disponible todavía."
+            log_warn " El DAG quedará registrado en Airflow pero fallará en"
+            log_warn " la tarea 'ingesta_datos' hasta que ejecutes:"
+            log_warn ""
+            log_warn "   make data-add CSV=<ruta>/CustomerChurn.csv"
+            log_warn ""
+            log_warn " Ese comando copia el CSV a $canonical_path,"
+            log_warn " lo versiona con DVC y lo sube al remote MinIO."
+            log_warn "═══════════════════════════════════════════════════════════"
+        fi
+    fi
+}
+
+# ──────────────────────────────────────────────
+# 7. Instalar dependencias Python en /opt/mlops_venv
+#
+# Problema conocido en Python 3.12: setuptools (que provee pkg_resources)
+# ya no se incluye en los venvs automáticamente. MLflow y otras librerías
+# lo importan durante su propia instalación, por lo que si setuptools no
+# está presente ANTES de que pip procese el resto del requirements.txt,
+# la instalación falla con "No module named 'pkg_resources'".
+#
+# Solución: bootstrap en dos fases —
+#   Fase 1: instalar setuptools y wheel primero, de forma aislada.
+#   Fase 2: instalar el requirements.txt completo con setuptools ya disponible.
+# ──────────────────────────────────────────────
+install_python_deps() {
+    local venv_pip="/opt/mlops_venv/bin/pip"
+    local req_file="$PROJECT_ROOT/requirements.txt"
+
+    if [[ ! -f "$venv_pip" ]]; then
+        log_warn "No se encontró $venv_pip — omitiendo instalación de dependencias."
+        return
+    fi
+
+    if [[ ! -f "$req_file" ]]; then
+        log_warn "No se encontró requirements.txt en $PROJECT_ROOT — omitiendo instalación."
+        return
+    fi
+
+    log_info "─── Fase 1: bootstrap de setuptools y wheel ───────────────"
+    # setuptools provee pkg_resources; wheel acelera la instalación de
+    # paquetes binarios. Ambos deben estar presentes antes de instalar
+    # mlflow, airflow y cualquier librería que los importe en tiempo de build.
+    if ! "$venv_pip" install \
+            --quiet \
+            --disable-pip-version-check \
+            "setuptools>=70" "wheel"; then
+        log_error "Falló el bootstrap de setuptools/wheel. Revisa la conectividad a PyPI."
+        exit 1
+    fi
+    log_info "setuptools y wheel instalados"
+
+    log_info "─── Fase 2: instalando requirements.txt completo ──────────"
+    log_info "  Archivo: $req_file"
+    if ! "$venv_pip" install \
+            --quiet \
+            --disable-pip-version-check \
+            -r "$req_file"; then
+        log_error "pip install -r requirements.txt falló."
+        log_error "Ejecuta manualmente para ver el error completo:"
+        log_error "  $venv_pip install -r $req_file"
+        exit 1
+    fi
+    log_info "Dependencias instaladas correctamente"
+
+    # Verificaciones rápidas de las dependencias críticas
+    local checks=("openpyxl" "mlflow" "pkg_resources")
+    for pkg in "${checks[@]}"; do
+        if /opt/mlops_venv/bin/python -c "import $pkg" 2>/dev/null; then
+            log_info "  ✓ $pkg disponible"
+        else
+            log_warn "  ✗ $pkg NO encontrado tras la instalación — revisa requirements.txt"
+        fi
+    done
+}
+
+# ──────────────────────────────────────────────
+# 8. Reiniciar servicios de Airflow para aplicar cambios
 # ──────────────────────────────────────────────
 restart_airflow() {
     local services=("airflow-webserver" "airflow-scheduler")
@@ -351,6 +508,8 @@ main() {
     remove_example_dags
     link_project_dag
     link_src_dir
+    ensure_data_dir
+    install_python_deps
     restart_airflow
 
     echo ""

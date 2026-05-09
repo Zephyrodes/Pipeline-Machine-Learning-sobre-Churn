@@ -27,6 +27,78 @@ logger = logging.getLogger(__name__)
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
 TARGET_COLUMN       = "Churn"
 
+# Archivo de credenciales que fetch_secrets.sh escribe para el servicio mlflow.
+# Contiene AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, MLFLOW_S3_ENDPOINT_URL, etc.
+# Se usa como fuente de respaldo si el entorno del worker de Airflow no tiene
+# las variables S3 inyectadas por el unit de systemd.
+_MLFLOW_SECRETS_FILE = "/run/mlops-secrets/minio/credentials"
+
+
+def _bootstrap_s3_credentials() -> None:
+    """
+    Garantiza que las variables de entorno necesarias para boto3/MinIO estén
+    presentes en el proceso actual antes de iniciar cualquier operación MLflow
+    que implique subida de artefactos a S3.
+
+    Orden de precedencia (mayor a menor):
+      1. Variables ya presentes en os.environ — no se sobreescriben.
+      2. Archivo de credenciales de MinIO en tmpfs (/run/mlops-secrets/minio/).
+      3. Error explícito si ninguna fuente está disponible.
+
+    Variables que boto3 necesita para autenticarse contra MinIO:
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - MLFLOW_S3_ENDPOINT_URL   (apunta a http://127.0.0.1:9000)
+      - AWS_DEFAULT_REGION       (MinIO ignora el valor pero boto3 lo exige)
+    """
+    required = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+
+    if all(os.getenv(k) for k in required):
+        logger.info(
+            "Credenciales S3/MinIO presentes en el entorno del proceso (vía systemd EnvironmentFile)"
+        )
+        return
+
+    logger.warning(
+        "Credenciales S3/MinIO no encontradas en el entorno — "
+        "intentando cargar desde %s", _MLFLOW_SECRETS_FILE
+    )
+
+    secrets_path = Path(_MLFLOW_SECRETS_FILE)
+    if not secrets_path.exists():
+        raise EnvironmentError(
+            f"No se encontraron credenciales S3/MinIO ni en el entorno ni en "
+            f"{_MLFLOW_SECRETS_FILE}. "
+            "Verifica que:\n"
+            "  1. El unit systemd de airflow-scheduler tiene EnvironmentFile=-/run/mlops-secrets/minio/credentials\n"
+            "  2. fetch_secrets.sh minio se ejecutó correctamente (make vault-unseal && make start)\n"
+            "  3. MinIO está activo: sudo systemctl status minio"
+        )
+
+    # Parsear el archivo de credenciales (formato KEY=VALUE, una por línea)
+    loaded: list[str] = []
+    for line in secrets_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key   = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+            loaded.append(key)
+
+    if not all(os.getenv(k) for k in required):
+        raise EnvironmentError(
+            f"El archivo {_MLFLOW_SECRETS_FILE} no contiene las claves requeridas: "
+            f"{required}. Revisa que fetch_secrets.sh minio escribe esas variables."
+        )
+
+    logger.info(
+        "Credenciales S3/MinIO cargadas desde %s: %s",
+        _MLFLOW_SECRETS_FILE, loaded
+    )
+
 
 def run_training(
     train_path: str,
@@ -49,6 +121,20 @@ def run_training(
         Diccionario con run_id de MLflow y métricas de entrenamiento.
     """
     logger.info("═══ Iniciando entrenamiento del modelo ═══")
+
+    # ── Bootstrap de credenciales S3/MinIO ───────────────────────────────
+    # mlflow.log_artifact() usa boto3 internamente para subir artefactos al
+    # backend S3 (MinIO). boto3 busca las credenciales en el entorno del
+    # proceso actual (el worker/scheduler de Airflow), NO en el proceso de
+    # mlflow-server. Si los units de systemd de Airflow no inyectan las
+    # variables AWS_*, boto3 lanza NoCredentialsError al primer log_artifact.
+    #
+    # Este bloque actúa como red de seguridad: si las variables no están en
+    # el entorno (porque el unit de systemd es antiguo o estamos en desarrollo
+    # local), las carga desde el archivo de credenciales de mlflow en tmpfs.
+    # En producción con el unit actualizado, ya estarán en el entorno y el
+    # bloque hace un simple log de confirmación sin tocar nada.
+    _bootstrap_s3_credentials()
 
     # ── Configurar MLflow ─────────────────────────────────────────────────
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)

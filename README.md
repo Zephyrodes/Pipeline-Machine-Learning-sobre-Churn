@@ -83,6 +83,15 @@ source credentials        ← ExecStart= lee y exporta las variables
     │
     ▼
 minio / mlflow / airflow / fastapi
+
+Airflow (webserver + scheduler) carga tres archivos de credenciales:
+  /run/mlops-secrets/airflow/credentials  → AIRFLOW__CORE__FERNET_KEY, etc.
+  /run/mlops-secrets/minio/credentials    → MINIO_ROOT_USER, ENDPOINT, etc.
+  /run/mlops-secrets/mlflow/credentials   → AWS_ACCESS_KEY_ID,
+                                            AWS_SECRET_ACCESS_KEY,
+                                            MLFLOW_S3_ENDPOINT_URL
+                                            (necesarios por boto3 al hacer
+                                             mlflow.log_artifact() → MinIO)
 ```
 
 ### Árbol de permisos de Vault
@@ -131,21 +140,23 @@ Pipeline-Machine-Learning-sobre-Churn/
 │       └── app.py
 ├── scripts/
 │   ├── provision_vm.sh
+│   ├── setup_airflow_dags.sh  # Configura DAGs, permisos y dependencias Python
 │   ├── setup_dvc.sh
+│   ├── start_minio.sh         # Arranca MinIO sincronizando credenciales con Vault
 │   └── vault/
-│       ├── setup_vault.sh        # Instala Vault, configura KV y AppRole
-│       ├── write_secrets.sh      # Escribe credenciales en Vault KV
-│       └── fetch_secrets.sh      # Obtiene secretos (llamado por systemd)
+│       ├── setup_vault.sh     # Instala Vault, configura KV y AppRole
+│       ├── write_secrets.sh   # Escribe credenciales en Vault KV
+│       └── fetch_secrets.sh   # Obtiene secretos (llamado por systemd)
 ├── dvc/
 │   └── .dvcconfig
 ├── tests/
 │   └── test_pipeline.py
 ├── data/
 │   ├── raw/
-│   │   └── CustomerChurn.csv     # Excluido de git — versionado con DVC
-│   └── processed/                # Generado por el pipeline (Parquet)
-├── Makefile                      # Punto de entrada único para despliegue y operación
-├── .env                          # Rellenar y cargar en Vault (excluido de git)
+│   │   └── CustomerChurn.csv  # Excluido de git — versionado con DVC
+│   └── processed/             # Generado por el pipeline (Parquet)
+├── Makefile                   # Punto de entrada único para despliegue y operación
+├── .env                       # Rellenar y cargar en Vault (excluido de git)
 ├── .gitignore
 ├── requirements.txt
 └── README.md
@@ -176,7 +187,7 @@ nano .env        # completar con los valores reales
 make install
 ```
 
-`make install` ejecuta en orden: permisos → aprovisionamiento → Vault → secretos → usuario admin de Airflow → MinIO → DVC → arranque de servicios.
+`make install` ejecuta en orden: permisos → aprovisionamiento → Vault → secretos → usuario admin de Airflow → MinIO → DVC → units de Airflow → arranque de servicios → configuración de DAGs.
 
 ### Pasos individuales
 
@@ -189,13 +200,14 @@ make vault-setup           # instalar y configurar HashiCorp Vault
 make vault-secrets         # cargar el .env en Vault
 make airflow-create-admin  # crear el usuario admin de Airflow leyendo credenciales desde Vault
 make dvc-setup             # inicializar DVC, crear buckets en MinIO y corregir ownership
+make fix-airflow-units     # regenerar units de Airflow con credenciales AWS/boto3 para MLflow (safe re-run)
 make start                 # arrancar todos los servicios (con auto-recovery del lock de Vault)
 ```
 
 ```bash
 make status           # estado de los servicios
 make logs             # logs en tiempo real
-make restart          # reiniciar todos los servicios
+make restart          # reiniciar todos los servicios (regenera units automáticamente)
 make test             # ejecutar suite de tests (usa pytest del venv directamente)
 make data-add         # versionar dataset con DVC y hacer push a MinIO
 make help             # ver todos los comandos disponibles
@@ -225,6 +237,16 @@ y crea el usuario admin de Airflow en la base de datos de `/opt/airflow`. Es
 idempotente: si el usuario ya existe no falla. Debe ejecutarse después de
 `vault-secrets` y antes o después de arrancar `airflow-webserver`. No forma parte
 de `provision` porque en ese momento Vault aún no existe.
+
+**`make fix-airflow-units`** — regenera los unit files de `airflow-webserver` y
+`airflow-scheduler` invocando `provision_vm.sh --only-units` (sin tocar apt, pip
+ni firewall) y reinicia ambos servicios. Corrige el problema por el que las tareas
+del DAG que llaman a `mlflow.log_artifact()` no encontraban las credenciales
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` para boto3: los units actualizados
+añaden `ExecStartPre=fetch_secrets.sh mlflow` y
+`EnvironmentFile=-/run/mlops-secrets/mlflow/credentials`, que sí contiene los
+nombres de variable que boto3 requiere. Seguro de re-ejecutar; `make restart` lo
+incluye automáticamente como dependencia.
 
 **`make start`** — arranca los cinco servicios. Antes de hacerlo, ejecuta
 `vault-unseal` que detecta y recupera automáticamente el lock de BoltDB de Raft

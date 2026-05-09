@@ -24,6 +24,15 @@ pandas==2.2.2
 numpy==1.26.4
 joblib==1.4.2
 
+# ── Lectura de archivos Excel (.xlsx / .xls) ──────────────────────────────────
+# openpyxl: requerido por pandas para leer archivos .xlsx (Office Open XML).
+# Se necesita cuando el archivo fuente es un Excel —incluso si tiene extensión
+# .csv— lo que pandas detecta automáticamente por los magic bytes del archivo.
+# xlrd: soporte para formato .xls legacy (Excel 97-2003). Solo se activa si
+# el archivo tiene magic bytes D0 CF 11 E0; no interfiere con .xlsx.
+openpyxl==3.1.5
+xlrd==2.0.1
+
 # ── Visualización ─────────────────────────────────────────────────────────────
 matplotlib==3.9.2
 

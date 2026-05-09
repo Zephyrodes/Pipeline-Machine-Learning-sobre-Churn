@@ -14,6 +14,9 @@ VAULT_DIR   := scripts/vault
 # Ruta del entorno virtual del proyecto
 VENV_BIN := /opt/mlops_venv/bin
 
+# Ruta canónica del dataset que espera el DAG (dag_churn_pipeline.py)
+DATA_RAW_CANONICAL := /opt/mlops/data/raw/telco_churn.csv
+
 # Silencia el warning de gosnowflake/dbus que aparece en cada invocación
 # de `vault` cuando no hay sesión de escritorio activa (servidor headless).
 export DBUS_SESSION_BUS_ADDRESS ?= /dev/null
@@ -24,7 +27,8 @@ YELLOW := \033[1;33m
 NC     := \033[0m
 
 .PHONY: help install provision configure-env vault-setup vault-unseal vault-secrets \
-        airflow-create-admin airflow-setup-dags dvc-setup start-minio start stop status restart logs test clean permissions data-add
+        airflow-create-admin airflow-setup-dags dvc-setup start-minio start stop status restart logs test clean permissions data-add \
+        fix-airflow-units
 
 # ──────────────────────────────────────────────
 # Ayuda
@@ -97,6 +101,7 @@ install: permissions
 	@$(MAKE) start-minio
 	@$(MAKE) airflow-create-admin
 	@$(MAKE) dvc-setup
+	@$(MAKE) fix-airflow-units
 	@$(MAKE) start
 	@$(MAKE) airflow-setup-dags
 	@echo ""
@@ -105,6 +110,15 @@ install: permissions
 	@echo -e "$(YELLOW)[NOTE]$(NC) Para activar el PATH del venv en esta sesión ejecuta:"
 	@echo -e "         source ~/.bashrc"
 	@echo -e "         Las próximas sesiones SSH lo tendrán activo automáticamente."
+	@echo ""
+	@# Usar sudo test para no fallar por permisos de traversal en /opt/mlops/
+	@if sudo test -f "$(DATA_RAW_CANONICAL)"; then \
+		echo -e "$(GREEN)[OK]$(NC)   Dataset listo en $(DATA_RAW_CANONICAL)"; \
+	else \
+		echo -e "$(YELLOW)[NOTE]$(NC) El dataset aún no está en la ruta del DAG."; \
+		echo -e "         El pipeline fallará en 'ingesta_datos' hasta que ejecutes:"; \
+		echo -e "           make data-add CSV=<ruta>/CustomerChurn.csv"; \
+	fi
 
 # ──────────────────────────────────────────────
 # Pasos individuales
@@ -233,6 +247,28 @@ airflow-setup-dags: permissions
 	@sudo bash $(SCRIPTS_DIR)/setup_airflow_dags.sh
 	@echo -e "$(GREEN)[MAKE]$(NC) DAGs configurados — el DAG 'churn_prediction_pipeline' ya está disponible"
 
+# Regenera los unit files de Airflow con el fix de credenciales AWS/boto3 y
+# hace daemon-reload + restart de los servicios afectados.
+#
+# Cuándo usarlo:
+#   - En una VM ya desplegada donde make install o make provision se ejecutó
+#     con la versión anterior de provision_vm.sh (sin fetch_secrets mlflow).
+#   - Después de cualquier cambio en create_airflow_systemd_services().
+#
+# Qué hace:
+#   1. Invoca provision_vm.sh --only-units para regenerar los .service files.
+#      --only-units omite apt-get, pip, creación de usuario y firewall.
+#   2. systemd daemon-reload (lo hace register_service dentro del script).
+#   3. Reinicia webserver y scheduler para que arranquen con el nuevo
+#      ExecStartPre=fetch_secrets.sh mlflow y los EnvironmentFile actualizados.
+fix-airflow-units: permissions
+	@echo -e "$(GREEN)[MAKE]$(NC) Regenerando units de Airflow con fix de credenciales AWS/boto3..."
+	@sudo bash $(SCRIPTS_DIR)/provision_vm.sh --only-units
+	@echo -e "$(GREEN)[MAKE]$(NC) Reiniciando airflow-webserver y airflow-scheduler..."
+	@sudo systemctl restart airflow-webserver airflow-scheduler
+	@echo -e "$(GREEN)[MAKE]$(NC) Units actualizados y servicios reiniciados"
+	@echo -e "$(GREEN)[MAKE]$(NC) Verifica con: sudo journalctl -u airflow-scheduler -n 30 --no-pager"
+
 dvc-setup: permissions
 	@echo -e "$(GREEN)[MAKE]$(NC) Configurando DVC..."
 	@sudo bash $(SCRIPTS_DIR)/setup_dvc.sh
@@ -273,7 +309,7 @@ stop:
 	@echo -e "$(GREEN)[MAKE]$(NC) Deteniendo servicios..."
 	@sudo systemctl stop $(SERVICES)
 
-restart: vault-unseal
+restart: vault-unseal fix-airflow-units
 	@echo -e "$(GREEN)[MAKE]$(NC) Reiniciando servicios..."
 	@sudo systemctl restart $(SERVICES)
 
@@ -298,12 +334,24 @@ test:
 # Usa rutas absolutas del venv — no requiere activar el entorno ni source .bashrc.
 # Uso: make data-add CSV=data/raw/CustomerChurn.csv
 CSV ?= data/raw/CustomerChurn.csv
+
 data-add:
 	@if [ ! -f "$(CSV)" ]; then \
 		echo -e "$(YELLOW)[WARN]$(NC) No se encontró el archivo: $(CSV)"; \
-		echo -e "         Uso: make data-add CSV=data/raw/tu_archivo.csv"; \
+		echo -e "         Uso: make data-add CSV=<ruta>/CustomerChurn.csv"; \
 		exit 1; \
 	fi
+	@# ── Crear directorio y fijar permisos de traversal ──────────────────
+	@# /opt/mlops/ y subdirectorios necesitan o+x para que azureuser y los
+	@# procesos del sistema puedan hacer stat() aunque el owner sea mlops.
+	@sudo mkdir -p "$$(dirname $(DATA_RAW_CANONICAL))"
+	@sudo chmod o+x /opt/mlops /opt/mlops/data /opt/mlops/data/raw
+	@# ── Copiar el CSV a la ruta canónica del DAG ─────────────────────────
+	@echo -e "$(GREEN)[MAKE]$(NC) Copiando dataset a la ruta del DAG..."
+	@sudo cp "$(CSV)" "$(DATA_RAW_CANONICAL)"
+	@sudo chown mlops:mlops "$(DATA_RAW_CANONICAL)"
+	@echo -e "$(GREEN)[MAKE]$(NC) Dataset disponible en $(DATA_RAW_CANONICAL)"
+	@# ── Versionar con DVC el archivo del repo ────────────────────────────
 	@echo -e "$(GREEN)[MAKE]$(NC) Versionando $(CSV) con DVC..."
 	@$(VENV_BIN)/dvc add $(CSV)
 	@if git diff --cached --quiet; then \

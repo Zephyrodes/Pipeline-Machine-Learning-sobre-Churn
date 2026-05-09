@@ -19,15 +19,42 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.utils.dates import days_ago
 
-# Importaciones de los módulos del proyecto
+# Los módulos del proyecto (ingest, preprocess, train, evaluate, register)
+# importan mlflow y otras librerías pesadas en su cabecera. Si se importan
+# aquí al nivel del módulo, Airflow falla al parsear el DAG con:
+#   ModuleNotFoundError: No module named 'pkg_resources'
+# porque el parser ejecuta estos imports antes de que cualquier tarea corra.
+#
+# Solución: lazy imports — cada callable importa su función justo antes de
+# usarla. El DAG se parsea sin tocar mlflow; las dependencias solo se cargan
+# en el worker cuando la tarea realmente se ejecuta.
 import sys
 sys.path.insert(0, "/opt/airflow/dags/src")
 
-from data.ingest        import run_data_ingestion
-from data.preprocess    import run_preprocessing
-from models.train       import run_training
-from models.evaluate    import run_evaluation
-from models.register    import run_model_registration
+
+def _run_ingestion(**context):
+    from data.ingest import run_data_ingestion
+    return run_data_ingestion(**context)
+
+
+def _run_preprocessing(**context):
+    from data.preprocess import run_preprocessing
+    return run_preprocessing(**context)
+
+
+def _run_training(**context):
+    from models.train import run_training
+    return run_training(**context)
+
+
+def _run_evaluation(**context):
+    from models.evaluate import run_evaluation
+    return run_evaluation(**context)
+
+
+def _run_model_registration(**context):
+    from models.register import run_model_registration
+    return run_model_registration(**context)
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +105,7 @@ with DAG(
     # ── Tarea 1: Ingesta de datos ──────────────────────────────────────────
     tarea_ingesta = PythonOperator(
         task_id="ingesta_datos",
-        python_callable=run_data_ingestion,
+        python_callable=_run_ingestion,
         op_kwargs={
             "source_path" : "/opt/mlops/data/raw/telco_churn.csv",
             "output_path" : "/opt/mlops/data/raw/telco_churn_latest.csv",
@@ -95,7 +122,7 @@ with DAG(
     # ── Tarea 2: Preprocesamiento ──────────────────────────────────────────
     tarea_preproceso = PythonOperator(
         task_id="preprocesamiento",
-        python_callable=run_preprocessing,
+        python_callable=_run_preprocessing,
         op_kwargs={
             "input_path"      : "/opt/mlops/data/raw/telco_churn_latest.csv",
             "output_train_path": "/opt/mlops/data/processed/train.parquet",
@@ -117,7 +144,7 @@ with DAG(
     # ── Tarea 3: Entrenamiento ─────────────────────────────────────────────
     tarea_entrenamiento = PythonOperator(
         task_id="entrenamiento",
-        python_callable=run_training,
+        python_callable=_run_training,
         op_kwargs={
             "train_path"       : "/opt/mlops/data/processed/train.parquet",
             "model_output_path": "/opt/mlops/models/",
@@ -142,7 +169,7 @@ with DAG(
     # ── Tarea 4: Evaluación ────────────────────────────────────────────────
     tarea_evaluacion = PythonOperator(
         task_id="evaluacion",
-        python_callable=run_evaluation,
+        python_callable=_run_evaluation,
         op_kwargs={
             "test_path"       : "/opt/mlops/data/processed/test.parquet",
             "promotion_threshold_auc": 0.75,    # AUC mínimo para promover
@@ -160,7 +187,7 @@ with DAG(
     # ── Tarea 5: Registro del modelo ───────────────────────────────────────
     tarea_registro = PythonOperator(
         task_id="registro_modelo",
-        python_callable=run_model_registration,
+        python_callable=_run_model_registration,
         op_kwargs={
             "model_name"        : "churn-predictor",
             "staging_alias"     : "Staging",

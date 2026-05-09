@@ -191,13 +191,9 @@ setup_python_virtualenv() {
 
     if [[ -f "$VENV_PATH/bin/activate" ]]; then
         log_skip "Entorno virtual ya existe en $VENV_PATH"
-        # shellcheck source=/dev/null
-        source "$VENV_PATH/bin/activate"
     else
         python3.12 -m venv "$VENV_PATH"
-        # shellcheck source=/dev/null
-        source "$VENV_PATH/bin/activate"
-        pip install --upgrade pip wheel
+        "$VENV_PATH/bin/pip" install --upgrade pip wheel
         log_info "Entorno virtual creado en $VENV_PATH"
     fi
 
@@ -208,10 +204,10 @@ setup_python_virtualenv() {
     # Idempotente: solo instala si setuptools no esta presente.
     local st_version
     st_version=$("$VENV_PATH/bin/pip" show setuptools 2>/dev/null \
-                 | awk '/^Version:/{print $2}')
+                 | awk '/^Version:/{print $2}' || true)
     if [[ -z "$st_version" ]]; then
         log_info "setuptools no encontrado — instalando..."
-        pip install --quiet "setuptools>=70"
+        "$VENV_PATH/bin/pip" install --quiet "setuptools>=70"
         log_info "setuptools instalado"
     else
         log_skip "setuptools $st_version ya presente"
@@ -269,6 +265,14 @@ install_minio() {
     # Solucion: EnvironmentFile= carga el archivo de credenciales que escribio
     # fetch_secrets.sh directamente en el entorno del proceso. MinIO recibe
     # MINIO_ROOT_USER y MINIO_ROOT_PASSWORD como variables de entorno reales.
+    #
+    # IMPORTANTE: El prefijo '-' en EnvironmentFile= es obligatorio.
+    # systemd evalua EnvironmentFile= ANTES de ejecutar ExecStartPre=, por lo
+    # que en el primer arranque (tmpfs vacio tras reboot) el archivo aun no
+    # existe. Sin '-', systemd aborta con "Failed to load environment files:
+    # No such file or directory" antes de que fetch_secrets.sh pueda crearlo.
+    # Con '-', la ausencia del archivo es no-fatal y ExecStartPre= puede correr
+    # y generar el archivo; en reinicios posteriores el archivo ya existe.
     local unit_content
     unit_content="$(cat << EOF
 [Unit]
@@ -281,7 +285,7 @@ Requires=vault.service
 Environment=VAULT_ADDR=http://127.0.0.1:8200
 Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/minio/credentials
 ExecStartPre=/usr/local/bin/fetch_secrets.sh minio
-EnvironmentFile=/run/mlops-secrets/minio/credentials
+EnvironmentFile=-/run/mlops-secrets/minio/credentials
 ExecStart=/usr/local/bin/minio server --console-address :${PORT_MINIO_CONSOLE} ${MINIO_HOME}/data
 User=${MLOPS_USER}
 Group=${MLOPS_GROUP}
@@ -306,20 +310,18 @@ EOF
 # ──────────────────────────────────────────────
 install_mlflow() {
     log_section "Instalando MLflow Tracking Server"
-    # shellcheck source=/dev/null
-    source "$VENV_PATH/bin/activate"
 
-    if pip show mlflow &>/dev/null; then
+    if "$VENV_PATH/bin/pip" show mlflow &>/dev/null; then
         local installed
-        installed="$(pip show mlflow | awk '/^Version:/{print $2}')"
+        installed="$("$VENV_PATH/bin/pip" show mlflow | awk '/^Version:/{print $2}')"
         if [[ "$installed" == "2.15.1" ]]; then
             log_skip "MLflow 2.15.1 ya instalado"
         else
             log_info "Actualizando MLflow $installed → 2.15.1"
-            pip install --quiet mlflow[extras]==2.15.1
+            "$VENV_PATH/bin/pip" install --quiet 'mlflow[extras]==2.15.1'
         fi
     else
-        pip install --quiet mlflow[extras]==2.15.1
+        "$VENV_PATH/bin/pip" install --quiet 'mlflow[extras]==2.15.1'
     fi
 
     mkdir -p "$MLFLOW_HOME/artifacts" "$MLFLOW_HOME/db"
@@ -365,23 +367,21 @@ EOF
 # ──────────────────────────────────────────────
 install_airflow() {
     log_section "Instalando Apache Airflow $AIRFLOW_VERSION"
-    # shellcheck source=/dev/null
-    source "$VENV_PATH/bin/activate"
     export AIRFLOW_HOME="$AIRFLOW_HOME"
 
-    if pip show apache-airflow &>/dev/null; then
+    if "$VENV_PATH/bin/pip" show apache-airflow &>/dev/null; then
         local installed
-        installed="$(pip show apache-airflow | awk '/^Version:/{print $2}')"
+        installed="$("$VENV_PATH/bin/pip" show apache-airflow | awk '/^Version:/{print $2}')"
         if [[ "$installed" == "$AIRFLOW_VERSION" ]]; then
             log_skip "Airflow $AIRFLOW_VERSION ya instalado"
         else
             log_info "Actualizando Airflow $installed → $AIRFLOW_VERSION"
             local CONSTRAINT_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
-            pip install --quiet "apache-airflow==${AIRFLOW_VERSION}" --constraint "$CONSTRAINT_URL"
+            "$VENV_PATH/bin/pip" install --quiet "apache-airflow==${AIRFLOW_VERSION}" --constraint "$CONSTRAINT_URL"
         fi
     else
         local CONSTRAINT_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
-        pip install --quiet "apache-airflow==${AIRFLOW_VERSION}" --constraint "$CONSTRAINT_URL"
+        "$VENV_PATH/bin/pip" install --quiet "apache-airflow==${AIRFLOW_VERSION}" --constraint "$CONSTRAINT_URL"
     fi
 
     # setuptools debe estar instalado ANTES de airflow db migrate.
@@ -390,13 +390,13 @@ install_airflow() {
     # y setuptools no está, la importación falla con ModuleNotFoundError:
     # pkg_resources — el error se registra en el log pero NO aborta la
     # migración, dejando el problema silencioso hasta que se arranca el scheduler.
-    if ! pip show setuptools &>/dev/null; then
+    if ! "$VENV_PATH/bin/pip" show setuptools &>/dev/null; then
         log_info "Instalando setuptools antes de db migrate..."
-        pip install --quiet "setuptools>=70"
+        "$VENV_PATH/bin/pip" install --quiet "setuptools>=70"
     fi
 
     # db migrate es idempotente por diseño (Alembic)
-    airflow db migrate
+    "$VENV_PATH/bin/airflow" db migrate
 
     mkdir -p "$AIRFLOW_HOME/dags"
     chown -R "$MLOPS_USER:$MLOPS_GROUP" "$AIRFLOW_HOME"
@@ -405,11 +405,34 @@ install_airflow() {
 }
 
 create_airflow_systemd_services() {
+    # Nota sobre credenciales S3/MinIO en las tareas del DAG:
+    #
+    # Cuando una tarea llama a mlflow.log_artifact(), MLflow usa boto3 para
+    # subir el artefacto al backend S3 (MinIO). boto3 busca las credenciales
+    # en el entorno del proceso que ejecuta la tarea — que es el worker/scheduler
+    # de Airflow, NO el proceso de mlflow-server.
+    #
+    # fetch_secrets.sh minio escribe las claves con los nombres que MinIO
+    # necesita (MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, ENDPOINT…). boto3 en
+    # cambio requiere AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY y
+    # MLFLOW_S3_ENDPOINT_URL — que son exactamente las claves que
+    # fetch_secrets.sh mlflow escribe (mapea root_user/root_password de MinIO
+    # a los nombres estándar de boto3).
+    #
+    # Solución: añadir ExecStartPre=fetch_secrets.sh mlflow y
+    # EnvironmentFile=-/run/mlops-secrets/mlflow/credentials a los units de
+    # Airflow. El prefijo '-' en EnvironmentFile= es obligatorio: systemd lo
+    # evalúa ANTES de ExecStartPre=, así que en el primer arranque (tmpfs vacío
+    # tras reboot) el archivo aún no existe. Sin '-' systemd abortaría.
+    #
+    # Se mantiene también fetch_secrets.sh minio / EnvironmentFile minio para
+    # que MINIO_ROOT_USER y ENDPOINT estén disponibles si algún paso del DAG
+    # los necesita directamente (p.ej. mc o dvc).
     local webserver_content
     webserver_content="$(cat << EOF
 [Unit]
 Description=Apache Airflow Webserver
-After=network.target vault.service
+After=network.target vault.service minio.service
 Requires=vault.service
 
 [Service]
@@ -418,6 +441,10 @@ Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/airflow/credentials
 Environment=AIRFLOW_HOME=${AIRFLOW_HOME}
 Environment=PATH=${VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStartPre=/usr/local/bin/fetch_secrets.sh airflow
+ExecStartPre=/usr/local/bin/fetch_secrets.sh minio
+ExecStartPre=/usr/local/bin/fetch_secrets.sh mlflow
+EnvironmentFile=-/run/mlops-secrets/minio/credentials
+EnvironmentFile=-/run/mlops-secrets/mlflow/credentials
 ExecStart=/bin/bash -c '\
     source \${SERVICE_SECRETS_FILE} && \
     ${VENV_PATH}/bin/airflow webserver --port ${PORT_AIRFLOW_WEBSERVER}'
@@ -437,7 +464,7 @@ EOF
     scheduler_content="$(cat << EOF
 [Unit]
 Description=Apache Airflow Scheduler
-After=network.target vault.service
+After=network.target vault.service minio.service
 Requires=vault.service
 
 [Service]
@@ -446,6 +473,10 @@ Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/airflow/credentials
 Environment=AIRFLOW_HOME=${AIRFLOW_HOME}
 Environment=PATH=${VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStartPre=/usr/local/bin/fetch_secrets.sh airflow
+ExecStartPre=/usr/local/bin/fetch_secrets.sh minio
+ExecStartPre=/usr/local/bin/fetch_secrets.sh mlflow
+EnvironmentFile=-/run/mlops-secrets/minio/credentials
+EnvironmentFile=-/run/mlops-secrets/mlflow/credentials
 ExecStart=/bin/bash -c '\
     source \${SERVICE_SECRETS_FILE} && \
     ${VENV_PATH}/bin/airflow scheduler'
@@ -526,19 +557,30 @@ declare -A ML_PACKAGES=(
     [joblib]=1.4.2
     [matplotlib]=3.9.2
     [python-multipart]=0.0.9
+    # Lectores de Excel: requeridos por pandas cuando el archivo fuente
+    # es un XLSX (o un Excel renombrado como .csv, detectado por magic bytes).
+    # openpyxl → .xlsx (Office Open XML, magic: 50 4B 03 04)
+    # xlrd     → .xls  (Excel 97-2003 binario, magic: D0 CF 11 E0)
+    [openpyxl]=3.1.5
+    [xlrd]=2.0.1
+    # setuptools provee pkg_resources, que mlflow importa en tiempo de módulo
+    # (mlflow/utils/requirements_utils.py línea 20). En Python 3.12 + pip moderno
+    # setuptools ya no se incluye en los venvs automáticamente, y pip puede
+    # desinstalarlo al resolver el árbol de dependencias de mlflow/airflow.
+    # Incluirlo aquí garantiza que queda reinstalado DESPUÉS de cualquier
+    # operación masiva de pip — que es cuando puede desaparecer.
+    [setuptools]=70.0.0
 )
 
 install_ml_dependencies() {
     log_section "Instalando dependencias ML"
-    # shellcheck source=/dev/null
-    source "$VENV_PATH/bin/activate"
 
     local to_install=()
 
     for pkg in "${!ML_PACKAGES[@]}"; do
         local want="${ML_PACKAGES[$pkg]}"
         local got
-        got="$(pip show "$pkg" 2>/dev/null | awk '/^Version:/{print $2}')"
+        got="$("$VENV_PATH/bin/pip" show "$pkg" 2>/dev/null | awk '/^Version:/{print $2}' || true)"
         if [[ "$got" == "$want" ]]; then
             log_skip "$pkg==$want ya instalado"
         else
@@ -551,21 +593,37 @@ install_ml_dependencies() {
 
     if [[ ${#to_install[@]} -eq 0 ]]; then
         log_skip "Todas las dependencias ML ya están al día"
-        return
+    else
+        # dvc[s3] y uvicorn[standard] necesitan el extra explícito
+        local install_args=()
+        for item in "${to_install[@]}"; do
+            case "$item" in
+                dvc==*)        install_args+=("dvc[s3]==${item#dvc==}") ;;
+                uvicorn==*)    install_args+=("uvicorn[standard]==${item#uvicorn==}") ;;
+                *)             install_args+=("$item") ;;
+            esac
+        done
+
+        "$VENV_PATH/bin/pip" install --quiet "${install_args[@]}"
+        log_info "Dependencias ML instaladas: ${install_args[*]}"
     fi
 
-    # dvc[s3] y uvicorn[standard] necesitan el extra explícito
-    local install_args=()
-    for item in "${to_install[@]}"; do
-        case "$item" in
-            dvc==*)        install_args+=("dvc[s3]==${item#dvc==}") ;;
-            uvicorn==*)    install_args+=("uvicorn[standard]==${item#uvicorn==}") ;;
-            *)             install_args+=("$item") ;;
-        esac
-    done
-
-    pip install --quiet "${install_args[@]}"
-    log_info "Dependencias ML instaladas: ${install_args[*]}"
+    # ── Garantía final de setuptools ──────────────────────────────────────
+    # pip puede desinstalar setuptools al resolver el árbol de dependencias
+    # de mlflow, airflow o dvc (ninguno lo declara como dependencia directa
+    # en Python 3.12). Este bloque se ejecuta SIEMPRE — incluso cuando todos
+    # los paquetes de ML_PACKAGES ya estaban al día — para asegurar que
+    # pkg_resources esté disponible tras cualquier operación de pip anterior.
+    local st_got
+    st_got=$("$VENV_PATH/bin/pip" show setuptools 2>/dev/null \
+             | awk '/^Version:/{print $2}' || true)
+    if [[ -z "$st_got" ]]; then
+        log_info "setuptools desapareció tras instalar dependencias ML — reinstalando..."
+        "$VENV_PATH/bin/pip" install --quiet "setuptools>=70"
+        log_info "setuptools reinstalado"
+    else
+        log_skip "setuptools $st_got presente tras instalar dependencias ML"
+    fi
 }
 
 # ──────────────────────────────────────────────

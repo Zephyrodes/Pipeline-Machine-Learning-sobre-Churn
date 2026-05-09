@@ -116,8 +116,15 @@ app = FastAPI(
 # Schemas de request/response (Pydantic)
 # ──────────────────────────────────────────────
 class CustomerFeatures(BaseModel):
-    """Features de un cliente para predicción de churn."""
-    gender           : int   = Field(..., ge=0, le=1,   description="0=Female, 1=Male")
+    """
+    Features de un cliente para predicción de churn.
+
+    Nota: el campo 'gender' fue eliminado deliberadamente.
+    El dataset fuente IBM Telco no incluye gender en el esquema interno
+    del pipeline (ver COLUMN_RENAME_MAP en ingest.py y COLUMNS_TO_DROP en
+    preprocess.py). El modelo entrenado no recibe ese campo, por lo que
+    incluirlo en el payload causaría un desajuste de dimensiones en predict().
+    """
     SeniorCitizen    : int   = Field(..., ge=0, le=1,   description="¿Es adulto mayor?")
     Partner          : int   = Field(..., ge=0, le=1,   description="¿Tiene pareja?")
     Dependents       : int   = Field(..., ge=0, le=1,   description="¿Tiene dependientes?")
@@ -139,7 +146,7 @@ class CustomerFeatures(BaseModel):
 
     model_config = {"json_schema_extra": {
         "example": {
-            "gender": 1, "SeniorCitizen": 0, "Partner": 1, "Dependents": 0,
+            "SeniorCitizen": 0, "Partner": 1, "Dependents": 0,
             "tenure": 12.0, "PhoneService": 1, "MultipleLines": 0,
             "InternetService": 1, "OnlineSecurity": 0, "OnlineBackup": 0,
             "DeviceProtection": 0, "TechSupport": 0, "StreamingTV": 1,

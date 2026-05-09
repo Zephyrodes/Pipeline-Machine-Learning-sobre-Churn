@@ -199,8 +199,77 @@ def run_data_ingestion(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Cargar, normalizar columnas y guardar con el esquema interno
-    df = pd.read_csv(source_path)
+    # ── Detección de formato y carga resiliente ───────────────────────────
+    # El archivo puede ser un CSV de texto plano o un Excel (.xlsx/.xls)
+    # renombrado con extensión .csv. Se detecta el tipo real leyendo los
+    # primeros bytes (magic bytes) en lugar de confiar en la extensión:
+    #
+    #   50 4B 03 04  →  ZIP → XLSX (Office Open XML)
+    #   D0 CF 11 E0  →  CFB → XLS  (formato binario Excel 97-2003)
+    #   Cualquier otro → tratar como CSV de texto
+    #
+    # Esto evita el ParserError que ocurre cuando pandas intenta leer
+    # bytes binarios como si fueran texto CSV.
+    XLSX_MAGIC = b"PK\x03\x04"
+    XLS_MAGIC  = b"\xd0\xcf\x11\xe0"
+
+    with open(source_path, "rb") as _fh:
+        file_magic = _fh.read(4)
+
+    df = None
+
+    if file_magic[:4] == XLSX_MAGIC[:4] or file_magic[:4] == XLS_MAGIC:
+        # ── Rama Excel ────────────────────────────────────────────────────
+        engine = "openpyxl" if file_magic[:4] == XLSX_MAGIC[:4] else "xlrd"
+        logger.info(
+            "Archivo detectado como Excel (magic=%s) — usando read_excel(engine='%s')",
+            file_magic[:4].hex(), engine,
+        )
+        try:
+            df = pd.read_excel(source_path, engine=engine)
+            logger.info(
+                "Excel cargado correctamente: %d filas × %d columnas",
+                len(df), len(df.columns),
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"No se pudo leer el archivo Excel {source_path}: {exc}"
+            ) from exc
+
+    else:
+        # ── Rama CSV ──────────────────────────────────────────────────────
+        # Se prueban tres encodings en orden de probabilidad.
+        # sep=None + engine='python' auto-detecta el delimitador (coma,
+        # punto y coma, tabulación, etc.) inspeccionando las primeras líneas,
+        # evitando el ParserError "Expected N fields, saw M".
+        # on_bad_lines='warn' omite líneas malformadas sin abortar la carga.
+        ENCODINGS = ["utf-8", "cp1252", "latin-1"]
+        for enc in ENCODINGS:
+            try:
+                df = pd.read_csv(
+                    source_path,
+                    encoding=enc,
+                    sep=None,               # auto-detecta el delimitador
+                    engine="python",        # requerido por sep=None
+                    on_bad_lines="warn",    # omite líneas malformadas sin abortar
+                )
+                logger.info(
+                    "CSV cargado con encoding '%s' | %d filas × %d columnas",
+                    enc, len(df), len(df.columns),
+                )
+                break
+            except UnicodeDecodeError:
+                logger.debug("Encoding '%s' falló — probando siguiente...", enc)
+            except Exception as parse_err:
+                logger.debug("Encoding '%s' — error de parseo: %s", enc, parse_err)
+
+        if df is None:
+            raise ValueError(
+                f"No se pudo leer el archivo {source_path} como CSV con ninguno "
+                f"de los encodings probados: {ENCODINGS}. "
+                "Verifica que el archivo sea un CSV o Excel válido."
+            )
+
     df = normalize_columns(df)
     validate_schema(df)
     df.to_csv(output_path, index=False)
