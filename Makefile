@@ -28,7 +28,7 @@ NC     := \033[0m
 
 .PHONY: help install provision configure-env vault-setup vault-unseal vault-secrets \
         airflow-create-admin airflow-setup-dags dvc-setup start-minio start stop status restart logs test clean permissions data-add \
-        fix-airflow-units
+        fix-airflow-units fix-fastapi-units
 
 # ──────────────────────────────────────────────
 # Ayuda
@@ -102,6 +102,7 @@ install: permissions
 	@$(MAKE) airflow-create-admin
 	@$(MAKE) dvc-setup
 	@$(MAKE) fix-airflow-units
+	@$(MAKE) fix-fastapi-units
 	@$(MAKE) start
 	@$(MAKE) airflow-setup-dags
 	@echo ""
@@ -269,6 +270,14 @@ fix-airflow-units: permissions
 	@echo -e "$(GREEN)[MAKE]$(NC) Units actualizados y servicios reiniciados"
 	@echo -e "$(GREEN)[MAKE]$(NC) Verifica con: sudo journalctl -u airflow-scheduler -n 30 --no-pager"
 
+fix-fastapi-units: permissions
+	@echo -e "$(GREEN)[MAKE]$(NC) Regenerando unit de FastAPI con credenciales MLflow/S3..."
+	@sudo bash $(SCRIPTS_DIR)/provision_vm.sh --only-units
+	@echo -e "$(GREEN)[MAKE]$(NC) Reiniciando mlops-api..."
+	@sudo systemctl restart mlops-api
+	@echo -e "$(GREEN)[MAKE]$(NC) Unit actualizado y servicio reiniciado"
+	@echo -e "$(GREEN)[MAKE]$(NC) Verifica con: sudo journalctl -u mlops-api -n 30 --no-pager"
+
 dvc-setup: permissions
 	@echo -e "$(GREEN)[MAKE]$(NC) Configurando DVC..."
 	@sudo bash $(SCRIPTS_DIR)/setup_dvc.sh
@@ -309,7 +318,7 @@ stop:
 	@echo -e "$(GREEN)[MAKE]$(NC) Deteniendo servicios..."
 	@sudo systemctl stop $(SERVICES)
 
-restart: vault-unseal fix-airflow-units
+restart: vault-unseal fix-airflow-units fix-fastapi-units
 	@echo -e "$(GREEN)[MAKE]$(NC) Reiniciando servicios..."
 	@sudo systemctl restart $(SERVICES)
 

@@ -504,6 +504,28 @@ EOF
 setup_fastapi_service() {
     log_section "Configurando servicio FastAPI"
     mkdir -p "$FASTAPI_APP_DIR"
+
+    # Copia app.py desde el repositorio al directorio de servicio.
+    # uvicorn arranca con WorkingDirectory=$FASTAPI_APP_DIR y módulo "app:app",
+    # por lo que el archivo debe estar en esa ruta. app.py solo importa
+    # dependencias de terceros (mlflow, fastapi, pydantic…), no paquetes
+    # locales, así que una copia plana es suficiente.
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local app_src="$script_dir/../src/api/app.py"
+
+    if [[ ! -f "$app_src" ]]; then
+        log_error "No se encontró app.py en $app_src — verifica la estructura del repo"
+        exit 1
+    fi
+
+    if [[ -f "$FASTAPI_APP_DIR/app.py" ]] && cmp -s "$app_src" "$FASTAPI_APP_DIR/app.py"; then
+        log_skip "app.py ya está actualizado en $FASTAPI_APP_DIR"
+    else
+        cp "$app_src" "$FASTAPI_APP_DIR/app.py"
+        log_info "app.py desplegado en $FASTAPI_APP_DIR"
+    fi
+
     chown -R "$MLOPS_USER:$MLOPS_GROUP" "$FASTAPI_APP_DIR"
 
     local unit_content
@@ -518,6 +540,17 @@ Environment=VAULT_ADDR=http://127.0.0.1:8200
 Environment=SERVICE_SECRETS_FILE=/run/mlops-secrets/fastapi/credentials
 Environment=PATH=${VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStartPre=/usr/local/bin/fetch_secrets.sh fastapi
+# fetch_secrets.sh mlflow escribe AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY y
+# MLFLOW_S3_ENDPOINT_URL — necesarios para que boto3 descargue el artefacto
+# del modelo desde MinIO cuando load_production_model() llama a
+# mlflow.sklearn.load_model(). Sin estas credenciales la descarga falla con
+# "NoCredentialsError" aunque el tracking server responda correctamente.
+# El prefijo '-' en EnvironmentFile= es obligatorio: systemd lo evalúa ANTES
+# de ExecStartPre=, así que en el primer arranque (tmpfs vacío) el archivo
+# aún no existe. Sin '-' systemd abortaría antes de que fetch_secrets.sh
+# pueda crearlo.
+ExecStartPre=/usr/local/bin/fetch_secrets.sh mlflow
+EnvironmentFile=-/run/mlops-secrets/mlflow/credentials
 ExecStart=/bin/bash -c '\
     source \${SERVICE_SECRETS_FILE} && \
     ${VENV_PATH}/bin/uvicorn app:app --host 0.0.0.0 --port ${PORT_FASTAPI}'
